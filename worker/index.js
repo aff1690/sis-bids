@@ -1,5 +1,5 @@
 // SIS Bids (Tony, 2026-11-18): estimating, bids and proposals, on its own site next to SIS Tools.
-// Cloudflare Pages, advanced mode: this file is the Worker, the rest of the folder is static files.
+// Cloudflare Worker with static assets (wrangler.jsonc): this file is the Worker, site/ holds the page files.
 // It shares SIS Tools' D1 database (bind it to this project as DB) and sign-in (a Cloudflare Access app for this
 // site's hostname in the same Access team: ACCESS_AUD, ACCESS_TEAM; ADMIN_EMAILS the same as SIS Tools). People and
 // roles come straight from SIS Tools' tables, so nobody is set up twice.

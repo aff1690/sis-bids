@@ -14,19 +14,25 @@ This build covers step 1 of the spec:
 
 The Bids tab shows a placeholder until build B2, which adds bids, the room tree and the takeoff.
 
-## Deploy (once)
+## Deploy (Workers Builds from GitHub)
 
-1. **Cloudflare dashboard › Workers & Pages › Create › Pages › Upload assets.** Name it `sis-bids` and upload this folder.
-   It holds `_worker.js`, `index.html`, `app.js` and `style.css`.
-2. **Settings › Bindings › D1 database:** add binding `DB` and pick **the same D1 database SIS Tools uses**.
-3. **Settings › Variables and secrets:**
-   - `ACCESS_AUD`: the Application Audience tag from step 4.
-   - `ACCESS_TEAM`: the same value as in SIS Tools.
-   - `ADMIN_EMAILS`: the same value as in SIS Tools.
-   - `SIS_TOOLS_HOST` (optional): SIS Tools' hostname, for example `tools.example.com`. This adds a link back to it in the header.
-4. **Zero Trust › Access › Applications › Add › Self-hosted:** add the new site's hostname, with the same policy SIS Tools uses.
-   Copy its **Application Audience (AUD) tag** into `ACCESS_AUD`.
-5. Deploy again so the bindings take effect, then open the site.
+Every push to `main` deploys automatically: Cloudflare runs `npx wrangler deploy`, using `wrangler.jsonc`.
+
+1. In `wrangler.jsonc`, fill in `database_name` and `database_id` for **the same D1 database SIS Tools uses**.
+   Find them under Workers & Pages › D1.
+2. In Cloudflare, go to Workers & Pages › Create › Import a repository and pick `aff1690/sis-bids`.
+   - Build command: leave blank.
+   - Deploy command: `npx wrangler deploy`.
+   - Path: `/`, the repo root.
+3. In the new Worker, open **Settings › Variables and secrets** and add these:
+   - `ACCESS_AUD`
+   - `ACCESS_TEAM`: the same value as SIS Tools.
+   - `ADMIN_EMAILS`: the same value as SIS Tools.
+   - `SIS_TOOLS_HOST`: optional.
+
+   `keep_vars` in `wrangler.jsonc` keeps deploys from wiping these.
+4. Put the Worker behind **Cloudflare Access** with the same policy as SIS Tools, either with the "Protect with Cloudflare Access" toggle
+   or under Zero Trust › Access › Applications. Copy the application's AUD tag into `ACCESS_AUD`.
 
 ## Who can use it
 
@@ -59,5 +65,5 @@ Nothing that SIS Tools already stores is changed.
 
 ## Local test
 
-Run `npx wrangler pages dev .` with a D1 binding `DB` and the variables `DEV_LOGIN=1` and `ADMIN_EMAILS=you@x`.
+Run `npx wrangler dev` with the variables `DEV_LOGIN=1` and `ADMIN_EMAILS=you@x`.
 Then open `http://127.0.0.1:8788/__dev` to sign in as any email.

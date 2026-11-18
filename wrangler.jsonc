@@ -1,0 +1,16 @@
+// SIS Bids as a Cloudflare Worker with static assets (Workers Builds runs `npx wrangler deploy` on every push to main).
+{
+  "name": "sis-bids",
+  "main": "worker/index.js",
+  "compatibility_date": "2024-11-01",
+  // the page files; the Worker runs first on every request so sign-in covers them too
+  "assets": { "directory": "site", "binding": "ASSETS", "run_worker_first": true },
+  // SIS Tools' own D1 database (Workers & Pages > D1 > the Crew Board / SIS Tools database > Database ID)
+  "d1_databases": [
+    { "binding": "DB", "database_name": "REPLACE_WITH_DATABASE_NAME", "database_id": "REPLACE_WITH_DATABASE_ID" }
+  ],
+  // ACCESS_AUD, ACCESS_TEAM, ADMIN_EMAILS and SIS_TOOLS_HOST are set in the dashboard (Settings > Variables and secrets);
+  // keep_vars stops a deploy from wiping them
+  "keep_vars": true,
+  "observability": { "enabled": true }
+}
