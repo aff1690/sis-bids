@@ -417,10 +417,10 @@ export default {
       }
       await init(env.DB);
       const me = await personOf(env, email);
-      if (!me || me.level === "none") return url.pathname.startsWith("/api/") ? bad("No access", 403) : msgPage(`You don't have access to SIS Bids. It's open to Project Managers and up. Ask an admin if you need it.<br><br><a href="https://${env.SIS_TOOLS_HOST || ""}">Back to SIS Tools</a>`, 403);
+      if (!me || me.level === "none") return url.pathname.startsWith("/api/") ? bad("No access", 403) : msgPage(`You don't have access to SIS Bids. It's open to Project Managers and up. Ask an admin if you need it.<br><br><a href="https://${env.SIS_TOOLS_HOST || "sistools.thefhouse.net"}">Back to SIS Tools</a>`, 403);
       if (url.pathname.startsWith("/api/")) {
         if (req.method !== "GET" && req.headers.get("Origin") && req.headers.get("Origin") !== url.origin) return bad("Bad origin", 403);
-        if (url.pathname === "/api/me") return json({ me, sisTools: env.SIS_TOOLS_HOST ? "https://" + env.SIS_TOOLS_HOST : "" });
+        if (url.pathname === "/api/me") return json({ me, sisTools: "https://" + (env.SIS_TOOLS_HOST || "sistools.thefhouse.net") });
         if (url.pathname.startsWith("/api/settings")) { const r = await settingsApi(req, env, url, me); if (r) return r; }
         if (url.pathname.startsWith("/api/catalog")) { const r = await catalogApi(req, env, url, me); if (r) return r; }
         return bad("Not found", 404);

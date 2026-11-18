@@ -1,21 +1,35 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SIS Bids</title><meta name="robots" content="noindex">
+<script>try{var t=localStorage.getItem("sis.theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/favicon-192.png">
+<link rel="apple-touch-icon" href="/icon-180.png">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Barlow:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/sis-header.css">
 </head><body>
-<header class="top">
-  <a class="brand" href="#/catalog"><span class="mark">SIS</span> Bids</a>
-  <nav id="nav">
-    <a data-r="bids" href="#/bids">Bids</a>
-    <a data-r="catalog" href="#/catalog">Catalog</a>
-    <a data-r="settings" href="#/settings">Settings</a>
-  </nav>
-  <span class="grow"></span>
-  <a id="sis" class="muted small" hidden>SIS Tools</a>
-  <span id="who" class="muted small"></span>
-</header>
+<header class="sis-hdr"><div class="sis-hdr-row">
+  <a class="sis-brand" href="#/bids" title="SIS Bids">
+    <img class="sis-logo sis-logo-l" src="/sis-logo.png" alt="Sierra Integrated Systems"><img class="sis-logo sis-logo-d" src="/sis-logo-dark.png" alt="">
+    <span class="sis-ttl"><b>SIS Bids</b><i>Estimates, bids and proposals</i></span></a>
+  <div class="sis-hdr-mid">
+    <span class="sis-me"><span id="who"></span> <span class="sis-role" id="role" hidden></span></span>
+    <button type="button" class="sis-theme" id="theme">☾ Dark mode</button>
+    <a class="sis-out" href="/cdn-cgi/access/logout">Sign out</a>
+  </div>
+  <div class="sis-hdr-right">
+    <a class="sis-btn sis-home" id="sis" href="https://sistools.thefhouse.net/">⌂ SIS Tools</a>
+    <a class="sis-btn sis-set" href="#/settings" data-r="settings">⚙ Settings</a>
+  </div>
+</div></header>
+<div class="sis-bar navbar"><nav id="nav">
+  <a data-r="bids" href="#/bids">Bids</a>
+  <a data-r="catalog" href="#/catalog">Catalog</a>
+  <a data-r="settings" href="#/settings">Settings</a>
+</nav></div>
 <main id="app"><p class="muted">Loading…</p></main>
 <div id="toast" role="status" aria-live="polite"></div>
 <script type="module" src="/app.js"></script>

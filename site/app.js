@@ -58,7 +58,7 @@ function readCsv(text) {
 // ---------------------------------------------------------------- routes
 async function route() {
   const [, sec = "catalog", sub] = location.hash.replace(/^#\/?/, "#/").split("/");
-  document.querySelectorAll("#nav a").forEach(a => a.classList.toggle("on", a.dataset.r === sec));
+  document.querySelectorAll("#nav a,.sis-set").forEach(a => a.classList.toggle("on", a.dataset.r === sec));
   try {
     if (sec === "settings") return await renderSettings(sub);
     if (sec === "bids") return renderBidsSoon();
@@ -309,12 +309,26 @@ async function renderSettings(sub) {
         can ? h("button.btn.sm", { onclick: () => { sys.push({ name: "New system", subs: [] }); drawSys(); } }, "+ System") : null)));
 }
 
+// ---------------------------------------------------------------- dark mode (same "sis.theme" setting and button as SIS Tools)
+{
+  const root = document.documentElement, btn = document.getElementById("theme");
+  const dark = () => root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  const paint = () => { btn.textContent = dark() ? "☀ Light mode" : "☾ Dark mode"; };
+  btn.onclick = () => { const t = dark() ? "light" : "dark"; root.dataset.theme = t; try { localStorage.setItem("sis.theme", t); } catch (e) {} paint(); };
+  paint();
+  // keep the tab bar right under the header while scrolling (sis-header.css reads --sis-hdr-h)
+  const hdr = document.querySelector(".sis-hdr"), setH = () => root.style.setProperty("--sis-hdr-h", Math.round(hdr.getBoundingClientRect().height) + "px");
+  setH(); if (window.ResizeObserver) new ResizeObserver(setH).observe(hdr); else addEventListener("resize", setH);
+}
+
 // ---------------------------------------------------------------- start
 (async () => {
   try {
     const r = await api("/api/me"); ME = r.me; SET = await api("/api/settings");
     document.getElementById("who").textContent = ME.name;
-    if (r.sisTools) { const a = document.getElementById("sis"); a.href = r.sisTools; a.hidden = false; }
+    const rb = document.getElementById("role"), rn = ME.role === "admin" ? "Admin" : (ME.roleName || "");
+    if (rn) { rb.textContent = rn; rb.className = "sis-role " + (["admin", "pm", "scheduler"].includes(ME.role) ? ME.role : "viewer"); rb.hidden = false; }
+    if (r.sisTools) document.getElementById("sis").href = r.sisTools;
     route();
   } catch (e) { show(h("div.note.bad", e.message)); }
 })();
