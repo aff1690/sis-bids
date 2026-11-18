@@ -1,4 +1,4 @@
-// SIS Bids as a Cloudflare Worker with static assets (Workers Builds runs `npx wrangler deploy` on every push to main).
+// SIS Bids as a Cloudflare Worker with static assets. Workers Builds runs `npx wrangler deploy` on every push to main.
 {
   "name": "sis-bids",
   "main": "worker/index.js",
