@@ -9,8 +9,13 @@
   "d1_databases": [
     { "binding": "DB", "database_name": "sis-tools-db", "database_id": "98981534-1296-4b3a-866b-2cbec51f5089" }
   ],
-  // ACCESS_AUD, ACCESS_TEAM, ADMIN_EMAILS and SIS_TOOLS_HOST are set in the dashboard (Settings > Variables and secrets);
-  // keep_vars stops a deploy from wiping them
+  // sign-in: ACCESS_AUD is the Cloudflare Access app's Application Audience tag for this site. ACCESS_TEAM is optional:
+  // when set it must be the team domain (like yourteam.cloudflareaccess.com), not a name. Not secrets; the repo is private.
+  "vars": {
+    "ACCESS_AUD": "1c11090a4a1b2c3d8890a383707a86669f49a70b24086cfac0b7f8f60d62bbe3",
+    "ADMIN_EMAILS": "tonyf@ihs-sierra.com"
+  },
+  // keep_vars: anything else added in the dashboard (like SIS_TOOLS_HOST) survives a deploy
   "keep_vars": true,
   "observability": { "enabled": true }
 }
