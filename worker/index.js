@@ -21,30 +21,36 @@ const DIVS = ["EL", "LV"];
 // ---------------------------------------------------------------- sign-in (same checks as SIS Tools)
 function readCookie(req, name) { const m = (req.headers.get("Cookie") || "").match(new RegExp("(?:^|;\\s*)" + name + "=([^;]+)")); return m ? m[1] : null; }
 const teamHost = env => String(env.ACCESS_TEAM).replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+// ACCESS_TEAM only counts when it is a team domain (yourteam.cloudflareaccess.com); a name like "SIS Tools" is ignored
+const teamOn = env => !!env.ACCESS_TEAM && /^[a-z0-9-]+\.cloudflareaccess\.com$/i.test(teamHost(env));
 const b64u = s => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)), c => c.charCodeAt(0));
 const certCache = {};
 const devLocal = (env, url) => env.DEV_LOGIN === "1" && (url.hostname === "127.0.0.1" || url.hostname === "localhost");
 async function accessEmail(req, env, url) {
   if (devLocal(env, url)) return (req.headers.get("X-Dev-Email") || decodeURIComponent(readCookie(req, "dev_email") || "") || env.DEV_EMAIL || "").toLowerCase() || null;
+  const why = r => { req.signinWhy = r; return null; };
   const tok = req.headers.get("Cf-Access-Jwt-Assertion") || readCookie(req, "CF_Authorization");
-  if (!tok || !env.ACCESS_AUD) return null;
+  if (!env.ACCESS_AUD) return why("ACCESS_AUD isn't set on this Worker.");
+  if (!tok) return why("No Cloudflare Access sign-in reached the site. The Access application probably doesn't cover this address yet: check that its domain matches this site's address exactly.");
   const [h, p, sig] = tok.split("."); if (!h || !p || !sig) return null;
   let head, body; try { head = JSON.parse(new TextDecoder().decode(b64u(h))); body = JSON.parse(new TextDecoder().decode(b64u(p))); } catch (e) { return null; }
   if (head.alg !== "RS256") return null;
   const now = Date.now() / 1000;
-  if (!(body.exp > now) || (body.nbf && body.nbf > now + 60)) return null;
+  if (!(body.exp > now) || (body.nbf && body.nbf > now + 60)) return why("The sign-in has expired. Reload to sign in again.");
   const aud = Array.isArray(body.aud) ? body.aud : [body.aud];
   const iss = String(body.iss || ""), team = iss.replace(/^https:\/\//, "");
-  if (!aud.includes(env.ACCESS_AUD) || !/^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/.test(iss) && !env.ACCESS_CERTS_URL || env.ACCESS_TEAM && team !== teamHost(env)) return null;
+  if (!aud.includes(env.ACCESS_AUD)) return why("The sign-in is for a different Access application. Copy the AUD tag from the Access app that protects THIS site's address into ACCESS_AUD.");
+  if (!/^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/.test(iss) && !env.ACCESS_CERTS_URL) return why("The sign-in didn't come from a Cloudflare Access team.");
+  if (teamOn(env) && team !== teamHost(env)) return why(`ACCESS_TEAM is ${teamHost(env)} but the sign-in came from ${team}.`);
   const c = certCache[team] ||= { at: 0, keys: [] };
   const load = async () => { const r = await fetch(env.ACCESS_CERTS_URL || `${iss}/cdn-cgi/access/certs`); c.at = Date.now(); c.keys = (await r.json()).keys || []; };
   if (Date.now() - c.at > 3600e3) await load();
   let jwk = c.keys.find(k => k.kid === head.kid);
   if (!jwk && Date.now() - c.at > 60e3) { await load(); jwk = c.keys.find(k => k.kid === head.kid); }
-  if (!jwk) return null;
+  if (!jwk) return why("Couldn't check the sign-in against Cloudflare's keys.");
   const key = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
   const ok = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, b64u(sig), enc.encode(h + "." + p));
-  return ok && body.email ? String(body.email).toLowerCase() : null;
+  return ok && body.email ? String(body.email).toLowerCase() : why(ok ? "The sign-in has no email address." : "The sign-in signature didn't check out.");
 }
 
 // ---------------------------------------------------------------- who is this, from SIS Tools' own records
@@ -407,7 +413,7 @@ export default {
       const email = await accessEmail(req, env, url);
       if (!email) {
         if (devLocal(env, url) && !url.pathname.startsWith("/api/")) return new Response(null, { status: 303, headers: { Location: "/__dev?next=" + encodeURIComponent(url.pathname) } });
-        return url.pathname.startsWith("/api/") ? bad("Sign in required", 401) : msgPage(env.ACCESS_AUD ? "Sign-in didn't come through. Reload the page to sign in again." : "Sign-in isn't set up. Add this site to Cloudflare Access and set ACCESS_AUD.", 401);
+        return url.pathname.startsWith("/api/") ? bad("Sign in required", 401) : msgPage(`Sign-in didn't come through.<br><br><small style="opacity:.75">${String(req.signinWhy || "Reload the page to sign in again.").replace(/[<>&]/g, "")}</small>`, 401);
       }
       await init(env.DB);
       const me = await personOf(env, email);
