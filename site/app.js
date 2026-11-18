@@ -147,6 +147,9 @@ function newBidDialog() {
   });
 }
 
+const bidChannel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("sis-bids") : null;
+let onTakeoffMsg = null; // set by the open bid page
+if (bidChannel) bidChannel.addEventListener("message", e => { if (onTakeoffMsg && location.hash.startsWith("#/bids/")) onTakeoffMsg(e.data || {}); });
 const BV = { id: 0, room: "all", view: "lines", sel: new Set(), qty: 1, sys: "" };
 async function renderBid(id) {
   if (BV.id !== id) Object.assign(BV, { id, room: "all", view: "lines", sel: new Set(), qty: 1, sys: "" });
@@ -159,6 +162,32 @@ async function renderBid(id) {
   const run = async (fn, msg) => { try { const r = await fn(); if (msg) toast(typeof msg === "function" ? msg(r) : msg); await reload(); return r; } catch (e) { toast(e.message, true); } };
   const putBid = b => run(() => api("/api/bids/" + id, { method: "PUT", json: b }));
   const saveLine = (lid, b) => run(() => api("/api/lines/" + lid, { method: "PUT", json: b }));
+
+  // takeoff (B2b): start one, pop it out in its own window, and keep the bid's rooms and counts in step with it
+  const takeoffBox = h("div.card.tobox");
+  let syncT = null, lastSync = null;
+  const popOut = (hash) => { const w = window.open(`/takeoff/?bid=${id}#${hash || `/job/${D.bid.takeoff_id}/plans`}`, "sis-takeoff-" + D.bid.takeoff_id, "popup,width=1500,height=950"); if (w) w.focus(); else toast("Your browser blocked the pop-out window. Allow pop-ups for this site.", true); };
+  const sync = async quiet => {
+    if (!D.bid.takeoff_id) return;
+    try { lastSync = await api(`/api/bids/${id}/takeoff-sync`, { json: {} }); if (!quiet) toast(`Takeoff synced: ${lastSync.devices} devices in ${lastSync.rooms} rooms`); await reload(); }
+    catch (e) { lastSync = { error: e.message }; drawTakeoff(); if (!quiet) toast(e.message, true); }
+  };
+  onTakeoffMsg = m => { if (m.t === "takeoff" && D.bid.takeoff_id && (!m.job || m.job === D.bid.takeoff_id)) { clearTimeout(syncT); syncT = setTimeout(() => sync(true), 1200); } };
+  const startTakeoff = async () => {
+    try { const t = await api("/api/takeoff/jobs", { json: { name: `${job.no} ${job.name}`.trim(), address: job.addr || "" } });
+      await api("/api/bids/" + id, { method: "PUT", json: { takeoff_id: t.id } }); D.bid.takeoff_id = t.id; drawTakeoff(); popOut(`/new/${t.id}`); }
+    catch (e) { toast(e.message, true); }
+  };
+  const drawTakeoff = () => {
+    if (!D.bid.takeoff_id) return fill(takeoffBox, h("div.row", h("b", "Takeoff"), h("span.muted.small.grow", "Load the plans, let Claude count the devices, and the rooms and counts land in this bid."),
+      h("button.btn.pri", { onclick: startTakeoff }, "Start takeoff")));
+    const s = lastSync, um = s && s.unmapped || [];
+    fill(takeoffBox, h("div.row", h("b", "Takeoff"),
+      h("span.muted.small.grow", s && !s.error ? `${s.devices} devices in ${s.rooms} rooms${s.pending ? `, ${s.pending} still to check on the plans` : ""}. Changes in the takeoff window update this bid by themselves.` : s && s.error ? s.error : "Linked. Changes in the takeoff window update this bid by themselves."),
+      h("button.btn.pri", { onclick: () => popOut() }, "⧉ Pop out takeoff"), h("button.btn.sm", { onclick: () => sync(false) }, "Sync now")),
+      um.length ? h("div.note.warn", { style: { margin: "10px 0 0" } }, `${um.length} device type${um.length > 1 ? "s aren't" : " isn't"} linked to a catalog item yet, so ${um.length > 1 ? "they come" : "it comes"} in at $0: ${um.map(x => x.label).join(", ")}. `,
+        ME.settings ? h("a", { href: "#/settings/takeoff" }, "Link them in Settings") : "Ask an admin to link them in Settings.", ".") : null);
+  };
 
   // rooms
   const kids = () => { const k = {}; for (const r of D.rooms) (k[r.parent_id || 0] ||= []).push(r); return k; };
@@ -186,7 +215,7 @@ async function renderBid(id) {
     const node = (label, key, amt, dep, extra) => h("div.tn" + (String(sel) === String(key) ? ".on" : ""), { style: { paddingLeft: 8 + dep * 16 + "px" }, onclick: () => { BV.room = key; BV.view = "lines"; drawAll(); } },
       h("span.grow", label), extra || null, h("span.muted.small", money(amt)));
     const rows = [node(h("b", "All rooms"), "all", D.totals.total - D.totals.tax, 0)];
-    const walk = (pid, dep) => (k[pid] || []).forEach(r => { rows.push(node(r.name, r.id, roomSell(r.id), dep)); walk(r.id, dep + 1); }); walk(0, 0);
+    const walk = (pid, dep) => (k[pid] || []).forEach(r => { rows.push(node(r.name, r.id, roomSell(r.id), dep, r.src_key ? h("span.tomark", { title: "From the takeoff" }, "⧉") : null)); walk(r.id, dep + 1); }); walk(0, 0);
     if (D.lines.some(l => !l.room_id)) rows.push(node(h("i", "Not in a room"), "none", (D.totals.byRoom["0"] || {}).sell || 0, 0));
     const rid = typeof sel === "number" ? sel : null;
     const addRooms = async parent => {
@@ -198,7 +227,7 @@ async function renderBid(id) {
       h("div.row", { style: { marginTop: "10px" } },
         h("button.btn.sm", { onclick: () => addRooms(null) }, "+ Room"),
         rid && depthOf(rid) < 2 ? h("button.btn.sm", { onclick: () => addRooms(rid) }, "+ Inside") : null,
-        rid ? h("button.btn.sm", { onclick: async () => { const v = await ask("Rename room", "Name", roomById()[rid].name, { ok: "Save" }); if (v && v.trim()) run(() => api("/api/rooms/" + rid, { method: "PUT", json: { name: v } })); } }, "Rename") : null,
+        rid ? h("button.btn.sm", { onclick: async () => { const v = await ask("Rename room", "Name", roomById()[rid].name, { ok: "Save" }); if (v && v.trim()) { const sk = roomById()[rid].src_key; await run(() => api("/api/rooms/" + rid, { method: "PUT", json: { name: v } })); if (sk && bidChannel) bidChannel.postMessage({ t: "bid", takeoff: D.bid.takeoff_id }); } } }, "Rename") : null,
         rid ? h("button.btn.sm.danger", { onclick: () => { const n = under(rid).size - 1, l = D.lines.filter(x => under(rid).has(x.room_id)).length;
           if (!confirm(`Delete ${roomPath(rid)}${n ? ` and its ${n} room${n > 1 ? "s" : ""} inside` : ""}${l ? `, with ${l} line${l > 1 ? "s" : ""}` : ""}?`)) return;
           BV.room = "all"; run(() => api("/api/rooms/" + rid, { method: "DELETE" })); } }, "Delete") : null)));
@@ -261,7 +290,7 @@ async function renderBid(id) {
         body.push(h("tr",
           h("td", h("input", { type: "checkbox", checked: BV.sel.has(l.id), onchange: e => { e.target.checked ? BV.sel.add(l.id) : BV.sel.delete(l.id); drawMain(); } })),
           h("td", h("input.qty", { type: "number", step: "any", min: "0", value: l.qty, onchange: e => saveLine(l.id, { qty: e.target.value }) })),
-          h("td", h("span.pill." + l.kind, KIND_LABEL[l.kind]), " ", h("b", [l.manufacturer, l.model].filter(Boolean).join(" ")),
+          h("td", h("span.pill." + l.kind, KIND_LABEL[l.kind]), " ", l.source === "takeoff" ? h("span.pill.to", { title: "Counted on the plans; the quantity follows the takeoff" }, "Takeoff") : null, " ", h("b", [l.manufacturer, l.model].filter(Boolean).join(" ")),
             l.description ? h("div.desc", l.description) : null,
             l.contents.length ? h("details.small", h("summary.muted", `${l.contents.length} part${l.contents.length > 1 ? "s" : ""}`), l.contents.map(c => h("div", `${c.qty} × ${[c.manufacturer, c.model].filter(Boolean).join(" ")}`))) : null),
           showRoom ? h("td.small", roomPath(l.room_id)) : null,
@@ -301,7 +330,7 @@ async function renderBid(id) {
     fill(mainBox, h("div.tabs", vt("lines", "Items"), vt("room", "By room"), vt("system", "By system"), vt("code", "By cost code")),
       BV.view === "lines" ? [addBar(), bulkBar(), linesTable()] : summary());
   };
-  const drawAll = () => { drawTotals(); drawTree(); drawMain(); };
+  const drawAll = () => { drawTotals(); drawTree(); drawMain(); drawTakeoff(); };
 
   // the bid's own settings
   const nm = h("input", { value: D.bid.name, onchange: e => putBid({ name: e.target.value }) });
@@ -335,9 +364,10 @@ async function renderBid(id) {
           h("button.btn.sm", { title: "Pull current catalog cost, sell and labor into every line", onclick: () => { if (confirm("Pull current catalog prices and labor into every line that came from the catalog? Prices you typed in are replaced.")) run(() => api(`/api/bids/${id}/refresh`, { json: {} }), r => `${r.updated} lines updated`); } }, "Update prices from catalog"),
           h("button.btn.sm", { disabled: D.bid.margin_pct == null, title: "Set every product and package to cost at this margin", onclick: () => { if (confirm(`Price every product and package at ${D.bid.margin_pct}% margin on cost?`)) run(() => api(`/api/bids/${id}/refresh`, { json: { at_margin: true } }), r => `${r.updated} lines repriced`); } }, "Apply margin to every line")))),
       h("div.card", h("header", h("h2", "Payment schedule"), h("button.btn.sm", { onclick: editSteps }, "Edit for this bid")), h("div.bd", pay, payBox))),
-    totalsBox,
+    takeoffBox, totalsBox,
     h("div.bidgrid", treeBox, mainBox));
   drawAll();
+  if (D.bid.takeoff_id) sync(true); // pick up anything counted since the bid was last open
 }
 
 // ---------------------------------------------------------------- catalog
@@ -560,6 +590,29 @@ async function renderSettings(sub) {
     (leadIn[dv] = h("input", { type: "number", min: SET.leads[dv] || 1, step: "1", value: SET.leads[dv] ?? "", placeholder: "200", style: { width: "120px" }, disabled: ro })),
     h("span.muted", SET.leads[dv] != null ? `Next number: ${dv}-${String(SET.leads[dv]).padStart(4, "0")}` : "Not set yet. Bids can't create jobs in this division until it is.")));
 
+  // takeoff devices: the catalog item or package each counted device type becomes in the bid
+  const tt = (await api("/api/takeoff-types")).types, picks = {};
+  const toBody = h("tbody");
+  const drawTo = () => fill(toBody, tt.map(t => {
+    const cur = t.key in picks ? picks[t.key] : t.item;
+    const q = h("input", { type: "search", placeholder: cur ? "Change…" : "Search the catalog…", disabled: ro, style: { width: "100%" } }), drop = h("div.list", { hidden: true });
+    let tm; q.addEventListener("input", () => { clearTimeout(tm); tm = setTimeout(async () => {
+      if (!q.value.trim()) { drop.hidden = true; return; }
+      const r = await api(`/api/catalog?q=${encodeURIComponent(q.value)}&limit=12`);
+      fill(drop, r.items.length ? r.items.map(it => h("div", { onmousedown: e => { e.preventDefault(); picks[t.key] = it; drawTo(); } }, h("span.pill." + it.kind, KIND_LABEL[it.kind]), " ", h("b", [it.manufacturer, it.model].filter(Boolean).join(" ")))) : h("div.muted", "No matches"));
+      drop.hidden = false; }, 200); });
+    q.addEventListener("blur", () => setTimeout(() => drop.hidden = true, 150));
+    return h("tr", h("td.muted.small", t.group), h("td", h("b", t.label)),
+      h("td", cur ? [h("span.pill." + cur.kind, KIND_LABEL[cur.kind]), " ", [cur.manufacturer, cur.model].filter(Boolean).join(" ")] : h("span.muted", "Not linked")),
+      h("td", { style: { width: "280px" } }, h("div.picker", q, drop)),
+      can && cur ? h("td", h("button.btn.sm.danger", { onclick: () => { picks[t.key] = null; drawTo(); } }, "Unlink")) : h("td"));
+  }));
+  drawTo();
+  const toCard = h("div.card", { id: "takeoff-devices" }, h("header", h("h2", "Takeoff devices"),
+      saveBtn("Save takeoff devices", () => api("/api/takeoff-types", { method: "PUT", json: { map: Object.fromEntries(Object.entries(picks).map(([k, v]) => [k, v ? v.id : null])) } }))),
+    h("div.bd", h("p.muted.small", { style: { marginTop: 0 } }, "Each device the takeoff counts on the plans comes into the bid as this catalog item or package, in the room it was counted in. A package can hold the box, device, plate, wire and labor. Unlinked devices still come in, at $0, so nothing is missed."),
+      h("div.wrap", h("table", h("thead", h("tr", h("th", "Group"), h("th", "Device"), h("th", "Becomes"), h("th", ""), h("th"))), toBody))));
+
   show(
     h("h1", "Settings"),
     !can ? h("div.note", "Only Admins can change settings. You can see them here.") : null,
@@ -574,7 +627,9 @@ async function renderSettings(sub) {
       h("div.bd", h("p.muted.small", { style: { marginTop: 0 } }, "A new job gets the next number in its division, like EL-0200 or LV-0200. The next number can only move forward, so no lead number is ever used twice."), leadRows)),
     h("div.card", h("header", h("h2", "Systems"), saveBtn("Save systems", () => api("/api/settings/systems", { method: "PUT", json: { systems: sys } }))),
       h("div.bd", h("p.muted.small", { style: { marginTop: 0 } }, "A system and its subsystems, like Lighting with Can Light and Tape Light. The D-Tools import adds any it finds. Type a subsystem and press Enter."), sysBox,
-        can ? h("button.btn.sm", { onclick: () => { sys.push({ name: "New system", subs: [] }); drawSys(); } }, "+ System") : null)));
+        can ? h("button.btn.sm", { onclick: () => { sys.push({ name: "New system", subs: [] }); drawSys(); } }, "+ System") : null)),
+    toCard);
+  if (sub === "takeoff") setTimeout(() => toCard.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
 }
 
 // ---------------------------------------------------------------- dark mode (same "sis.theme" setting and button as SIS Tools)

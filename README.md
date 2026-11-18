@@ -15,7 +15,14 @@ This build covers step 1 of the spec:
 **Bids (build B2a):** start a bid from a new lead job (it takes the next EL-/LV- lead number and makes the job in SIS Tools) or an
 existing SIS Tools job. Each bid has a room tree (level › room › sub-room), items placed in rooms under systems, live totals
 (equipment, services, labor at the division rate, tax on materials only), views by room, system and cost code, a payment
-schedule that can be changed per bid, revisions, and one active bid per job. Build B2b moves the Electrical Takeoff in.
+schedule that can be changed per bid, revisions, and one active bid per job.
+
+**Takeoff (build B2b):** the Electrical Takeoff from SIS Tools now lives at `/takeoff/`, without its estimate, catalog and
+assemblies pages. A bid's **Start takeoff** makes its takeoff and opens it in a pop-out window. The takeoff's levels and rooms
+become the bid's room tree, and every counted device lands in its room as the catalog item or package picked for that device
+type under **Settings › Takeoff devices**. Changes in the pop-out update the bid by themselves, and renaming a takeoff room in
+the bid renames it in the takeoff. Plan PDFs are stored in the R2 bucket `sis-bids-files` (binding `FILES`), and reading plans
+uses the `ANTHROPIC_API_KEY` secret. Its tables are `bto_*`, so SIS Tools' old `takeoff_*` jobs are left alone.
 
 ## Deploy (Workers Builds from GitHub)
 
@@ -65,8 +72,9 @@ New tables, all created on first use:
 | `bids` | One row per bid revision, tied to a SIS Tools job |
 | `bid_rooms` | Each bid's room tree |
 | `bid_lines` | Items in a bid, with prices and labor copied from the catalog when added |
+| `bto_*` | The takeoff: plans, sheets, rooms, devices, zones, specs and equipment |
 
-Settings live in SIS Tools' `settings` table under the keys `bids:costCodes`, `bids:paySchedules` and `bids:systems`.
+Settings live in SIS Tools' `settings` table under the keys `bids:costCodes`, `bids:paySchedules`, `bids:systems` and `bids:deviceMap`.
 Nothing that SIS Tools already stores is changed.
 
 ## Local test

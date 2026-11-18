@@ -5,6 +5,8 @@
   "compatibility_date": "2024-11-01",
   // the page files; the Worker runs first on every request so sign-in covers them too
   "assets": { "directory": "site", "binding": "ASSETS", "run_worker_first": true },
+  // takeoff plan PDFs
+  "r2_buckets": [ { "binding": "FILES", "bucket_name": "sis-bids-files" } ],
   // SIS Tools' own D1 database, shared (the ID is what binds it; the name is only a label for wrangler commands)
   "d1_databases": [
     { "binding": "DB", "database_name": "sis-tools-db", "database_id": "98981534-1296-4b3a-866b-2cbec51f5089" }

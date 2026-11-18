@@ -7,6 +7,8 @@
 // Step 1 (this build): settings (cost codes with rates per division, payment schedules, systems, lead numbers) and the
 // catalog (products, labor items, service items, packages, D-Tools catalog import).
 
+import { handle as takeoffApi } from "./takeoff/worker.js";
+import { DEVICE_TYPES } from "./takeoff/deviceTypes.js";
 const enc = new TextEncoder();
 const SECURITY = { "X-Content-Type-Options": "nosniff", "Referrer-Policy": "strict-origin-when-cross-origin", "X-Frame-Options": "SAMEORIGIN" };
 const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...SECURITY } });
@@ -413,6 +415,8 @@ async function initBids(db) {
       tax_base REAL DEFAULT 0, labor TEXT DEFAULT '[]', contents TEXT DEFAULT '[]', sort REAL DEFAULT 0, source TEXT DEFAULT 'manual', src_key TEXT DEFAULT '', note TEXT DEFAULT '')`),
     db.prepare("CREATE INDEX IF NOT EXISTS bid_lines_bid ON bid_lines (bid_id, room_id)"),
   ]);
+  // columns added after B2a went live: the bid's takeoff, and which takeoff room a bid room came from
+  for (const sql of ["ALTER TABLE bids ADD COLUMN takeoff_id INTEGER", "ALTER TABLE bid_rooms ADD COLUMN src_key TEXT DEFAULT ''"]) await db.prepare(sql).run().catch(() => {});
 }
 const nowIso = () => new Date().toISOString();
 const uid36 = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -506,9 +510,81 @@ const LINE_COLS = ["bid_id", "room_id", "system", "item_id", "kind", "manufactur
 const insLine = (env, o) => env.DB.prepare(`INSERT INTO bid_lines (${LINE_COLS.join(", ")}) VALUES (${LINE_COLS.map(() => "?").join(", ")})`)
   .bind(...LINE_COLS.map(c => c === "labor" || c === "contents" ? JSON.stringify(o[c] || []) : o[c] === undefined ? (c === "qty" ? 1 : c === "sort" ? Date.now() : c === "room_id" || c === "item_id" || c === "unit_price" ? null : "") : o[c]));
 
+
+// ---------------------------------------------------------------- takeoff -> bid (B2b)
+// The takeoff (tables bto_*) counts devices per room on the plans. A sync puts its levels and rooms into the bid's room tree
+// (src_key "to:L:<level>" / "to:R:<takeoff room id>") and one line per room and device type (source "takeoff"), using the
+// catalog item or package picked for that device type in Settings (bids:deviceMap). Quantities follow the takeoff; a price or
+// system typed on a takeoff line is kept while its catalog item stays the same.
+const TYPE_LABEL = Object.fromEntries(DEVICE_TYPES.map(t => [t.key, t.label]));
+async function deviceMap(env) { const v = await setting(env, "bids:deviceMap"); return v && typeof v === "object" ? v : {}; }
+async function takeoffSync(env, me, bid) {
+  const DB = env.DB, tid = bid.takeoff_id;
+  if (!tid) return bad("This bid has no takeoff yet.");
+  const tj = await DB.prepare("SELECT id FROM bto_jobs WHERE id = ?").bind(tid).first().catch(() => null); if (!tj) return bad("This bid's takeoff is gone.");
+  const trooms = (await DB.prepare("SELECT id, level, number, name FROM bto_rooms WHERE job_id = ? ORDER BY level, number, name").bind(tid).all()).results || [];
+  const counts = (await DB.prepare("SELECT room_id, type, COUNT(*) AS n, SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pend FROM bto_devices WHERE job_id = ? GROUP BY room_id, type").bind(tid).all()).results || [];
+  const brooms = (await DB.prepare("SELECT * FROM bid_rooms WHERE bid_id = ?").bind(bid.id).all()).results || [];
+  const byKey = {}; for (const r of brooms) if (r.src_key) byKey[r.src_key] = r;
+  let sort = Date.now(), roomsAdded = 0; const keep = new Set();
+  const ensure = async (key, name, parent) => {
+    keep.add(key); const r = byKey[key];
+    if (r) { if (r.name !== name || (r.parent_id || null) !== parent) await DB.prepare("UPDATE bid_rooms SET name = ?, parent_id = ? WHERE id = ?").bind(name, parent, r.id).run(); return r.id; }
+    const x = await DB.prepare("INSERT INTO bid_rooms (bid_id, parent_id, name, sort, src_key) VALUES (?, ?, ?, ?, ?) RETURNING id").bind(bid.id, parent, name, sort++, key).first();
+    roomsAdded++; byKey[key] = { id: x.id, name, parent_id: parent }; return x.id;
+  };
+  const roomOf = {};
+  for (const r of trooms) { const lv = String(r.level || "").trim(); const pid = lv ? await ensure("to:L:" + lv.toLowerCase(), lv, null) : null;
+    roomOf[r.id] = await ensure("to:R:" + r.id, [r.number, r.name].filter(Boolean).join(" ").trim() || "Room", pid); }
+  // lines
+  const dmap = await deviceMap(env), cache = {}, unmapped = new Set(); let pending = 0;
+  const old = (await DB.prepare("SELECT id, src_key, item_id FROM bid_lines WHERE bid_id = ? AND source = 'takeoff'").bind(bid.id).all()).results || [];
+  const oldBy = Object.fromEntries(old.map(l => [l.src_key, l])), st = [], seen = new Set();
+  for (const c of counts) {
+    pending += c.pend || 0;
+    const key = `${c.room_id || 0}:${c.type}`, itemId = dmap[c.type] ? Math.floor(numOr(dmap[c.type])) : null, room = c.room_id ? roomOf[c.room_id] || null : null;
+    if (!itemId) unmapped.add(c.type);
+    seen.add(key); const prev = oldBy[key];
+    if (prev && (prev.item_id || null) === itemId) { st.push(DB.prepare("UPDATE bid_lines SET qty = ?, room_id = ? WHERE id = ?").bind(c.n, room, prev.id)); continue; }
+    if (prev) st.push(DB.prepare("DELETE FROM bid_lines WHERE id = ?").bind(prev.id));
+    let o = itemId ? (cache[itemId] ??= await lineFromItem(env, itemId, bid)) : null;
+    o = o ? { ...o } : { item_id: null, kind: "product", manufacturer: "", model: TYPE_LABEL[c.type] || c.type, description: "Counted on the plans. Pick a catalog item for this device type in Settings › Takeoff devices to price it.", unit_cost: 0, unit_price: 0, tax_base: 0, labor: [], contents: [] };
+    st.push(insLine(env, { ...o, bid_id: bid.id, room_id: room, qty: c.n, source: "takeoff", src_key: key, sort: sort++ }));
+  }
+  for (const l of old) if (!seen.has(l.src_key)) st.push(DB.prepare("DELETE FROM bid_lines WHERE id = ?").bind(l.id));
+  for (let i = 0; i < st.length; i += 100) await DB.batch(st.slice(i, i + 100));
+  // takeoff rooms that are gone: drop the bid room when nothing else is in it, otherwise just unlink it
+  let roomsGone = 0;
+  const left = ((await DB.prepare("SELECT r.id, r.src_key, (SELECT COUNT(*) FROM bid_lines l WHERE l.room_id = r.id) AS n, (SELECT COUNT(*) FROM bid_rooms k WHERE k.parent_id = r.id) AS kids FROM bid_rooms r WHERE r.bid_id = ? AND r.src_key LIKE 'to:%'").bind(bid.id).all()).results || [])
+    .filter(r => !keep.has(r.src_key)).sort((a, b) => (a.src_key.startsWith("to:L:") ? 1 : 0) - (b.src_key.startsWith("to:L:") ? 1 : 0));
+  for (const r of left) { if (!r.n && !r.kids) { await DB.prepare("DELETE FROM bid_rooms WHERE id = ?").bind(r.id).run(); roomsGone++; } else await DB.prepare("UPDATE bid_rooms SET src_key = '' WHERE id = ?").bind(r.id).run(); }
+  await touch(env, me, bid.id);
+  return json({ ok: true, rooms: trooms.length, roomsAdded, roomsGone, lines: counts.length, devices: counts.reduce((a, c) => a + c.n, 0), pending, unmapped: [...unmapped].map(k => ({ key: k, label: TYPE_LABEL[k] || k })) });
+}
+// renaming a bid room that came from the takeoff renames it there too (the room number stays)
+async function renameTakeoffRoom(env, rm, name) {
+  const DB = env.DB, k = rm.src_key || "";
+  if (k.startsWith("to:R:")) { const tr = await DB.prepare("SELECT number FROM bto_rooms WHERE id = ?").bind(Number(k.slice(5))).first().catch(() => null); if (!tr) return;
+    const n = tr.number && name.startsWith(tr.number + " ") ? name.slice(tr.number.length + 1).trim() : name; await DB.prepare("UPDATE bto_rooms SET name = ? WHERE id = ?").bind(n, Number(k.slice(5))).run(); }
+  else if (k.startsWith("to:L:")) { const bid = await DB.prepare("SELECT takeoff_id FROM bids WHERE id = ?").bind(rm.bid_id).first(); if (!bid || !bid.takeoff_id) return;
+    await DB.prepare("UPDATE bto_rooms SET level = ? WHERE job_id = ? AND lower(trim(level)) = ?").bind(name, bid.takeoff_id, k.slice(5)).run();
+    await DB.prepare("UPDATE bid_rooms SET src_key = ? WHERE id = ?").bind("to:L:" + name.trim().toLowerCase(), rm.id).run(); }
+}
+
 async function bidsApi(req, env, url, me) {
   const p = url.pathname, M = req.method;
   const body = async () => (await req.json().catch(() => null)) || {};
+  if (p === "/api/takeoff-types" && M === "GET") {
+    const map = await deviceMap(env), ids = Object.values(map).map(Number).filter(Boolean), items = {};
+    for (let i = 0; i < ids.length; i += 90) { const part = ids.slice(i, i + 90); for (const r of (await env.DB.prepare(`SELECT id, kind, manufacturer, model FROM bid_catalog WHERE id IN (${part.map(() => "?").join(",")})`).bind(...part).all()).results || []) items[r.id] = r; }
+    return json({ types: DEVICE_TYPES.map(t => ({ key: t.key, label: t.label, group: t.group, code: t.code, item: items[map[t.key]] || null })) });
+  }
+  if (p === "/api/takeoff-types" && M === "PUT") {
+    if (!me.settings) return bad("Only Admins (or roles that can manage roles) can change settings.", 403);
+    const b = await body(), map = await deviceMap(env);
+    for (const [k, v] of Object.entries(b.map || {})) { if (!TYPE_LABEL[k]) continue; if (v) map[k] = Math.floor(numOr(v)); else delete map[k]; }
+    await putSetting(env, "bids:deviceMap", map); return json({ ok: true });
+  }
   if (p === "/api/jobs" && M === "GET") {
     const q = str(url.searchParams.get("q"), 80).toLowerCase(), jobs = await sisJobs(env);
     const counts = Object.fromEntries((((await env.DB.prepare("SELECT job_id, COUNT(*) AS n FROM bids GROUP BY job_id").all()).results) || []).map(r => [r.job_id, r.n]));
@@ -537,10 +613,11 @@ async function bidsApi(req, env, url, me) {
       base.pay_id || "", JSON.stringify(base.pay_steps || []), base.notes || "", now, me.email, now, me.email).first();
     const id = r.id;
     await env.DB.prepare("UPDATE bids SET active = 0 WHERE job_id = ? AND id <> ?").bind(job.id, id).run(); // the newest bid is the job's active one until someone picks another
+    if (src && src.bid.takeoff_id) await env.DB.prepare("UPDATE bids SET takeoff_id = ? WHERE id = ?").bind(src.bid.takeoff_id, id).run(); // a revision keeps the same takeoff
     if (src) { // copy the room tree and lines
       const map = {}, order = []; const byParent = {}; for (const rm of src.rooms) (byParent[rm.parent_id || 0] ||= []).push(rm);
       const walk = pid => { for (const rm of byParent[pid] || []) { order.push(rm); walk(rm.id); } }; walk(0);
-      for (const rm of order) { const x = await env.DB.prepare("INSERT INTO bid_rooms (bid_id, parent_id, name, sort) VALUES (?, ?, ?, ?) RETURNING id").bind(id, rm.parent_id ? map[rm.parent_id] : null, rm.name, rm.sort).first(); map[rm.id] = x.id; }
+      for (const rm of order) { const x = await env.DB.prepare("INSERT INTO bid_rooms (bid_id, parent_id, name, sort, src_key) VALUES (?, ?, ?, ?, ?) RETURNING id").bind(id, rm.parent_id ? map[rm.parent_id] : null, rm.name, rm.sort, rm.src_key || "").first(); map[rm.id] = x.id; }
       const stmts = src.lines.map(l => insLine(env, { ...l, bid_id: id, room_id: l.room_id ? map[l.room_id] || null : null }));
       for (let i = 0; i < stmts.length; i += 200) await env.DB.batch(stmts.slice(i, i + 200));
     }
@@ -563,6 +640,7 @@ async function bidsApi(req, env, url, me) {
       if ("pay_id" in b) { const s = (await paySchedules(env)).find(x => x.id === b.pay_id); if (s) { set.pay_id = s.id; set.pay_steps = JSON.stringify(s.steps); } }
       if ("pay_steps" in b) { const st = (Array.isArray(b.pay_steps) ? b.pay_steps : []).slice(0, 20).map(x => ({ label: str(x.label, 80), pct: r2(numOr(x.pct)) }));
         const tot = r2(st.reduce((a, x) => a + x.pct, 0)); if (st.length && Math.abs(tot - 100) > 0.001) return bad(`The milestones add up to ${tot}%. They must total 100%.`); set.pay_steps = JSON.stringify(st); }
+      if ("takeoff_id" in b) set.takeoff_id = b.takeoff_id ? Math.floor(numOr(b.takeoff_id)) : null;
       if (b.active === true) { await env.DB.prepare("UPDATE bids SET active = 0 WHERE job_id = ?").bind(bid.job_id).run(); set.active = 1; }
       const ks = Object.keys(set); if (ks.length) await env.DB.prepare(`UPDATE bids SET ${ks.map(k => k + " = ?").join(", ")} WHERE id = ?`).bind(...ks.map(k => set[k]), id).run();
       await touch(env, me, id); return json({ ok: true });
@@ -571,6 +649,7 @@ async function bidsApi(req, env, url, me) {
       await env.DB.batch([env.DB.prepare("DELETE FROM bid_lines WHERE bid_id = ?").bind(id), env.DB.prepare("DELETE FROM bid_rooms WHERE bid_id = ?").bind(id), env.DB.prepare("DELETE FROM bids WHERE id = ?").bind(id)]);
       return json({ ok: true });
     }
+    if (sub === "/takeoff-sync" && M === "POST") return takeoffSync(env, me, bid);
     // rooms: {parent_id, name} or {parent_id, names: [...]} (paste a list, one per line)
     if (sub === "/rooms" && M === "POST") {
       const b = await body(), pid = b.parent_id ? Math.floor(numOr(b.parent_id)) : null;
@@ -621,7 +700,7 @@ async function bidsApi(req, env, url, me) {
   if (m) {
     const rid = Number(m[1]), rm = await env.DB.prepare("SELECT * FROM bid_rooms WHERE id = ?").bind(rid).first(); if (!rm) return bad("That room is gone.", 404);
     if (M === "PUT") { const b = await body();
-      if ("name" in b) { const n = str(b.name, 120); if (!n) return bad("Enter a name."); await env.DB.prepare("UPDATE bid_rooms SET name = ? WHERE id = ?").bind(n, rid).run(); }
+      if ("name" in b) { const n = str(b.name, 120); if (!n) return bad("Enter a name."); await env.DB.prepare("UPDATE bid_rooms SET name = ? WHERE id = ?").bind(n, rid).run(); if (rm.src_key) await renameTakeoffRoom(env, rm, n); }
       if ("sort" in b) await env.DB.prepare("UPDATE bid_rooms SET sort = ? WHERE id = ?").bind(numOr(b.sort), rid).run();
       await touch(env, me, rm.bid_id); return json({ ok: true }); }
     if (M === "DELETE") { // the room, its sub-rooms and their lines
@@ -687,7 +766,8 @@ export default {
         if (url.pathname === "/api/me") return json({ me, sisTools: "https://" + (env.SIS_TOOLS_HOST || "sistools.thefhouse.net") });
         if (url.pathname.startsWith("/api/settings")) { const r = await settingsApi(req, env, url, me); if (r) return r; }
         if (url.pathname.startsWith("/api/catalog")) { const r = await catalogApi(req, env, url, me); if (r) return r; }
-        if (/^\/api\/(jobs|bids|rooms|lines)(\/|$)/.test(url.pathname)) { const r = await bidsApi(req, env, url, me); if (r) return r; }
+        if (url.pathname.startsWith("/api/takeoff/")) { const r = await takeoffApi(req, env, url, me, { level: me.level }); if (r) return r; }
+        if (/^\/api\/(jobs|bids|rooms|lines|takeoff-types)(\/|$)/.test(url.pathname)) { const r = await bidsApi(req, env, url, me); if (r) return r; }
         return bad("Not found", 404);
       }
       const res = await env.ASSETS.fetch(req), out = new Response(res.body, res);

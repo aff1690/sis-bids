@@ -95,3 +95,4 @@ details.small summary{cursor:pointer}
 @media (max-width:1000px){.bidtop{grid-template-columns:minmax(0,1fr)}}
 .bidtop .card .bd>select{width:100%;margin-bottom:8px}
 .picker input{width:100%}
+.tobox{padding:12px 16px}.pill.to{background:var(--blue-bg);color:var(--blue);border-color:transparent}.tomark{color:var(--blue);font-size:12px}

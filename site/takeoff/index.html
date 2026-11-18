@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script>try{var t=localStorage.getItem("sis.theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Takeoff · SIS Bids</title><meta name="robots" content="noindex">
+  <link rel="icon" href="sis/favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="sis/favicon-32.png">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="sis/sis-header.css">
+  <style>.sis-hdr-row .sis-btn.sis-home{position:static!important}</style>
+</head>
+<body>
+  <header class="sis-hdr"><div class="sis-hdr-row">
+    <a class="sis-brand" href="/#/bids" title="SIS Bids">
+      <img class="sis-logo sis-logo-l" src="sis/sis-logo.png" alt="Sierra Integrated Systems"><img class="sis-logo sis-logo-d" src="sis/sis-logo-dark.png" alt="">
+      <span class="sis-ttl"><b>Takeoff</b><i>SIS Bids · plans, rooms and device counts</i></span></a>
+    <div class="sis-hdr-mid"></div>
+    <div class="sis-hdr-right"><a class="sis-btn sis-home" id="tobid" href="/#/bids">← Bids</a></div>
+  </div></header>
+  <nav class="subnav">
+    <div id="jobnav" class="tabs" hidden>
+      <span id="jobname" class="jobname"></span>
+      <a data-tab="specs">Specs</a>
+      <a data-tab="equipment">Equipment</a>
+      <a data-tab="plans">Plans</a>
+      <a data-tab="rooms">Room tree</a>
+    </div>
+    <div class="tabs right">
+      <a href="#/specs" data-global="specs">Spec library</a>
+    </div>
+  </nav>
+  <main id="app"></main>
+  <div id="toast" class="toast" hidden></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
