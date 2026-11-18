@@ -1,0 +1,320 @@
+// SIS Bids page (step 1: catalog and settings). Plain modules, no build step.
+const app = document.getElementById("app");
+const show = (...kids) => app.replaceChildren(...kids.flat().filter(k => k != null && k !== false));
+let ME = null, SET = null; // signed-in person; settings (cost codes, pay schedules, systems, lead numbers)
+
+// ---------------------------------------------------------------- helpers
+function h(tag, attrs, ...kids) {
+  const [t, ...cls] = tag.split("."); const el = document.createElement(t || "div"); if (cls.length) el.className = cls.join(" ");
+  if (attrs && (typeof attrs !== "object" || attrs instanceof Node || Array.isArray(attrs))) { kids.unshift(attrs); attrs = null; }
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "style" && typeof v === "object") Object.assign(el.style, v);
+    else if (k === "value") el.value = v;
+    else if (k === "checked") el.checked = !!v;
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  const add = k => { if (k == null || k === false) return; if (Array.isArray(k)) return k.forEach(add); el.append(k instanceof Node ? k : String(k)); };
+  kids.forEach(add); return el;
+}
+async function api(path, opts = {}) {
+  const o = { method: opts.method || (opts.json ? "POST" : "GET"), headers: {} };
+  if (opts.json) { o.body = JSON.stringify(opts.json); o.headers["Content-Type"] = "application/json"; }
+  const r = await fetch(path, o); let b = null; try { b = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error((b && b.error) || `Something went wrong (${r.status}).`);
+  return b;
+}
+let toastT; function toast(msg, isBad) { const t = document.getElementById("toast"); t.textContent = msg; t.className = "show" + (isBad ? " bad" : ""); clearTimeout(toastT); toastT = setTimeout(() => t.className = "", isBad ? 6000 : 3000); }
+const money = n => n == null || !isFinite(n) ? "—" : (n < 0 ? "-$" : "$") + Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const KIND_LABEL = { product: "Product", labor: "Labor item", service: "Service item", package: "Package" };
+// labor time: seconds <-> H:MM:SS. Accepts 1:30:00, 0:15 (h:mm), 15m, 90s, or decimal hours (0.25).
+const fmtHms = s => { s = Math.round(s || 0); const hh = Math.floor(s / 3600), mm = Math.floor(s % 3600 / 60), ss = s % 60; return `${hh}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`; };
+function parseHms(v) {
+  const t = String(v || "").trim().toLowerCase(); if (!t) return 0;
+  let m = t.match(/^(\d+):(\d{1,2}):(\d{1,2})$/); if (m) return +m[1] * 3600 + +m[2] * 60 + +m[3];
+  m = t.match(/^(\d+):(\d{1,2})$/); if (m) return +m[1] * 3600 + +m[2] * 60;
+  m = t.match(/^(\d+(?:\.\d+)?)\s*(h|hr|hrs|m|min|s|sec)$/); if (m) return Math.round(+m[1] * ({ h: 3600, hr: 3600, hrs: 3600, m: 60, min: 60, s: 1, sec: 1 }[m[2]]));
+  m = t.match(/^\d*\.?\d+$/); if (m) return Math.round(parseFloat(t) * 3600);
+  return NaN;
+}
+const codeName = c => { const x = (SET.costCodes || []).find(k => k.code === c); return x ? `${x.code} ${x.name}` : c; };
+const rateOf = (c, div) => { const x = (SET.costCodes || []).find(k => k.code === c); return x ? (x.rates || {})[div] || 0 : 0; };
+const laborText = labor => (labor || []).map(l => `${fmtHms(l.seconds)} ${codeName(l.cost_code)}`).join(", ");
+function dialog(build) { const d = h("dialog"); document.body.append(d); d.addEventListener("close", () => d.remove()); build(d); d.showModal(); return d; }
+const field = (label, input, cls) => h("label" + (cls ? "." + cls : ""), label, input);
+
+// tiny CSV reader (quotes, commas and newlines inside quotes, BOM)
+function readCsv(text) {
+  text = text.replace(/^﻿/, ""); const rows = []; let row = [], cur = "", q = false;
+  for (let i = 0; i < text.length; i++) { const c = text[i];
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
+    else if (c === '"') q = true; else if (c === ",") { row.push(cur); cur = ""; } else if (c === "\n" || c === "\r") { if (c === "\r" && text[i + 1] === "\n") i++; row.push(cur); rows.push(row); row = []; cur = ""; } else cur += c; }
+  if (cur || row.length) { row.push(cur); rows.push(row); }
+  const head = (rows.shift() || []).map(s => s.trim());
+  return rows.filter(r => r.some(x => x.trim())).map(r => Object.fromEntries(head.map((k, i) => [k, r[i] ?? ""])));
+}
+
+// ---------------------------------------------------------------- routes
+async function route() {
+  const [, sec = "catalog", sub] = location.hash.replace(/^#\/?/, "#/").split("/");
+  document.querySelectorAll("#nav a").forEach(a => a.classList.toggle("on", a.dataset.r === sec));
+  try {
+    if (sec === "settings") return await renderSettings(sub);
+    if (sec === "bids") return renderBidsSoon();
+    return await renderCatalog();
+  } catch (e) { show(h("div.note.bad", e.message)); }
+}
+window.addEventListener("hashchange", route);
+
+function renderBidsSoon() {
+  show(h("h1", "Bids"), h("div.note", "Bids, the room tree and the takeoff arrive in the next build. Set up your cost code rates, payment schedules and lead numbers in ",
+    h("a", { href: "#/settings" }, "Settings"), " and load your catalog in ", h("a", { href: "#/catalog" }, "Catalog"), " so they're ready."));
+}
+
+// ---------------------------------------------------------------- catalog
+const CAT = { q: "", kind: "", offset: 0, limit: 100 };
+async function renderCatalog() {
+  const d = await api(`/api/catalog?q=${encodeURIComponent(CAT.q)}&kind=${CAT.kind}&limit=${CAT.limit}&offset=${CAT.offset}`);
+  const total = Object.values(d.counts).reduce((a, b) => a + b, 0);
+  const search = h("input", { type: "search", placeholder: "Search manufacturer, model, part #, description, vendor…", value: CAT.q, style: { flex: "1", minWidth: "220px" } });
+  let tm; search.addEventListener("input", () => { clearTimeout(tm); tm = setTimeout(() => { CAT.q = search.value; CAT.offset = 0; renderCatalog().then(() => { const s = app.querySelector("input[type=search]"); s.focus(); s.setSelectionRange(s.value.length, s.value.length); }); }, 250); });
+  const tab = (k, label) => h("button.tab" + (CAT.kind === k ? ".on" : ""), { onclick: () => { CAT.kind = k; CAT.offset = 0; renderCatalog(); } }, label, h("span.n", k ? d.counts[k] || 0 : total));
+  const file = h("input", { type: "file", accept: ".csv,text/csv", hidden: true, onchange: e => { const f = e.target.files[0]; e.target.value = ""; if (f) importDialog(f); } });
+  const rows = d.items.map(it => {
+    const price = it.kind === "package" ? it.rollup && it.rollup.price : it.unit_price;
+    const cost = it.kind === "package" ? it.rollup && it.rollup.cost : it.unit_cost;
+    const lab = it.kind === "package" ? Object.entries((it.rollup || {}).labor || {}).map(([c, s]) => ({ cost_code: c, seconds: s })) : it.labor;
+    return h("tr.click", { onclick: () => editItem(it.id) },
+      h("td", h("span.pill." + it.kind, KIND_LABEL[it.kind])),
+      h("td", h("b", [it.manufacturer, it.model].filter(Boolean).join(" ")), it.part_number ? h("div.muted.small", "#" + it.part_number) : null),
+      h("td", h("div.desc", it.short_desc || "")),
+      h("td.muted.small", [it.category, it.subcategory].filter(Boolean).join(" / ")),
+      h("td.num", money(cost)), h("td.num", price == null ? h("span.muted", "at rate") : money(price)),
+      h("td.small", laborText(lab)), h("td.muted.small", it.vendor || ""));
+  });
+  const pages = Math.ceil(d.total / CAT.limit), pg = Math.floor(CAT.offset / CAT.limit) + 1;
+  show(
+    h("div.row", h("h1.grow", "Catalog"),
+      h("button.btn", { onclick: () => editItem(0, "product") }, "+ Product"),
+      h("button.btn", { onclick: () => editItem(0, "labor") }, "+ Labor item"),
+      h("button.btn", { onclick: () => editItem(0, "service") }, "+ Service item"),
+      h("button.btn", { onclick: () => editItem(0, "package") }, "+ Package"),
+      h("button.btn.pri", { onclick: () => file.click() }, "Import D-Tools catalog"), file),
+    !total ? h("div.note.warn", "The catalog is empty. Export your catalog from D-Tools SI (Product Explorer, export to CSV) and click Import D-Tools catalog. Old D-Tools labor codes are converted to your cost codes as they come in.") : null,
+    h("div.tabs", tab("", "All"), tab("product", "Products"), tab("labor", "Labor items"), tab("service", "Service items"), tab("package", "Packages")),
+    h("div.row", { style: { marginBottom: "10px" } }, search),
+    h("div.card", h("div.wrap", { style: { maxHeight: "calc(100vh - 290px)" } }, h("table",
+      h("thead", h("tr", h("th", "Type"), h("th", "Item"), h("th", "Description"), h("th", "Category"), h("th.num", "Cost"), h("th.num", "Sell"), h("th", "Labor (H:M:S)"), h("th", "Vendor"))),
+      h("tbody", rows.length ? rows : h("tr", h("td", { colspan: 8 }, h("span.muted", CAT.q ? "Nothing matches that search." : "Nothing here yet."))))))),
+    pages > 1 ? h("div.row", h("span.muted.small", `${d.total.toLocaleString()} items · page ${pg} of ${pages}`), h("span.grow"),
+      h("button.btn.sm", { disabled: pg <= 1, onclick: () => { CAT.offset -= CAT.limit; renderCatalog(); } }, "Previous"),
+      h("button.btn.sm", { disabled: pg >= pages, onclick: () => { CAT.offset += CAT.limit; renderCatalog(); } }, "Next")) : null);
+}
+
+// labor lines editor: [{cost_code, seconds}]
+function laborEditor(lines, onChange) {
+  const box = h("div");
+  const codes = (SET.costCodes || []).filter(c => !c.retired);
+  const draw = () => {
+    box.replaceChildren(...lines.map((l, i) => {
+      const t = h("input.hms", { value: fmtHms(l.seconds), placeholder: "0:15:00", title: "H:MM:SS, or decimal hours like 0.25" });
+      t.addEventListener("change", () => { const s = parseHms(t.value); if (isNaN(s)) { toast("Enter time as H:MM:SS, for example 0:15:00.", true); t.value = fmtHms(l.seconds); return; } l.seconds = s; t.value = fmtHms(s); onChange && onChange(); });
+      const sel = h("select", { onchange: e => { l.cost_code = e.target.value; onChange && onChange(); } }, h("option", { value: "" }, "Cost code…"),
+        codes.map(c => h("option", { value: c.code, selected: c.code === l.cost_code }, `${c.code} ${c.name}`)),
+        l.cost_code && !codes.some(c => c.code === l.cost_code) ? h("option", { value: l.cost_code, selected: true }, `${l.cost_code} (retired)`) : null);
+      return h("div.lab-row", t, sel, h("button.btn.sm.danger", { type: "button", onclick: () => { lines.splice(i, 1); draw(); onChange && onChange(); } }, "Remove"));
+    }), h("button.btn.sm", { type: "button", onclick: () => { lines.push({ cost_code: "", seconds: 0 }); draw(); } }, "+ Labor line"));
+  };
+  draw(); return box;
+}
+
+// package contents editor with a catalog search to add parts
+function packageEditor(items, onChange) {
+  const box = h("div"), list = h("div"), sum = h("div.stats", { style: { margin: "8px 0" } });
+  const recalc = async () => {
+    const ids = items.map(x => x.item_id); if (!ids.length) { sum.replaceChildren(h("span.muted", "Add parts below.")); return; }
+    try { const r = await api("/api/catalog/rollup", { json: { ids } }); let cost = 0, price = 0, lab = {}; const noPrice = [];
+      for (const x of items) { const ru = r.rollup[x.item_id] || {}; cost += x.qty * (ru.cost || 0); if (ru.price == null) noPrice.push(x); else price += x.qty * ru.price; for (const [c, s] of Object.entries(ru.labor || {})) lab[c] = (lab[c] || 0) + x.qty * s; }
+      sum.replaceChildren(h("div", h("b", money(cost)), "Cost"), h("div", h("b", money(price)), "Sell (parts)"), h("div", h("b", fmtHms(Object.values(lab).reduce((a, b) => a + b, 0))), "Labor"),
+        h("div.small.muted", { style: { alignSelf: "center" } }, Object.entries(lab).map(([c, s]) => `${fmtHms(s)} ${codeName(c)}`).join(" · ")));
+    } catch (e) { sum.replaceChildren(h("span.muted", e.message)); }
+  };
+  const draw = () => {
+    list.replaceChildren(h("table", h("thead", h("tr", h("th", "Qty"), h("th", "Part"), h("th"))),
+      h("tbody", items.map((x, i) => h("tr",
+        h("td", { style: { width: "110px" } }, h("input", { type: "number", step: "any", min: "0", value: x.qty, style: { width: "90px" }, onchange: e => { x.qty = Math.max(0, parseFloat(e.target.value) || 0); onChange && onChange(); recalc(); } })),
+        h("td", h("span.pill." + (x.kind || "product"), KIND_LABEL[x.kind || "product"]), " ", [x.manufacturer, x.model].filter(Boolean).join(" ")),
+        h("td.num", h("button.btn.sm.danger", { type: "button", onclick: () => { items.splice(i, 1); draw(); onChange && onChange(); recalc(); } }, "Remove")))))));
+  };
+  const q = h("input", { type: "search", placeholder: "Search the catalog to add a part…", style: { width: "100%" } }), drop = h("div.list", { hidden: true });
+  let tm; q.addEventListener("input", () => { clearTimeout(tm); tm = setTimeout(async () => {
+    if (!q.value.trim()) { drop.hidden = true; return; }
+    const r = await api(`/api/catalog?q=${encodeURIComponent(q.value)}&limit=15`);
+    drop.replaceChildren(...r.items.map(it => h("div", { onclick: () => { items.push({ item_id: it.id, qty: 1, kind: it.kind, manufacturer: it.manufacturer, model: it.model }); q.value = ""; drop.hidden = true; draw(); onChange && onChange(); recalc(); } },
+      h("span.pill." + it.kind, KIND_LABEL[it.kind]), " ", h("b", [it.manufacturer, it.model].filter(Boolean).join(" ")), it.part_number ? h("span.muted", "  #" + it.part_number) : null)));
+    if (!r.items.length) drop.replaceChildren(h("div.muted", "No matches")); drop.hidden = false; }, 200); });
+  q.addEventListener("blur", () => setTimeout(() => drop.hidden = true, 200));
+  draw(); recalc();
+  box.append(list, h("div.picker", { style: { marginTop: "8px" } }, q, drop), sum);
+  return box;
+}
+
+async function editItem(id, kind) {
+  const it = id ? (await api(`/api/catalog/${id}`)).item : { kind, manufacturer: "", model: "", labor: [], items: [], taxable: kind === "product", unit_price: kind === "labor" ? null : 0, unit_cost: 0, order_units: 1, extra: {} };
+  kind = it.kind;
+  const f = {}, inp = (k, attrs = {}) => (f[k] = h("input", { value: it[k] ?? "", ...attrs }));
+  const labor = (it.labor || []).map(l => ({ ...l })), items = (it.items || []).map(x => ({ ...x }));
+  if (kind === "labor" && !labor.length) labor.push({ cost_code: "", seconds: 3600 });
+  const sysOpts = [];
+  for (const s of SET.systems || []) { sysOpts.push(s.name); for (const sub of s.subs || []) sysOpts.push(`${s.name}: ${sub}`); }
+  const sysList = h("datalist", { id: "syslist" }, sysOpts.map(v => h("option", { value: v })));
+  const nameLabel = kind === "product" ? "Model *" : "Name *";
+  const priceHint = kind === "labor" ? "Leave Unit sell empty to sell at the cost code's rate" : "";
+  dialog(d => {
+    const save = async e => {
+      e.preventDefault();
+      const b = { kind };
+      for (const [k, el] of Object.entries(f)) b[k] = el.type === "checkbox" ? el.checked : el.value;
+      if ("unit_price" in b && b.unit_price === "") b.unit_price = null;
+      if (kind !== "package") { if (labor.some(l => l.seconds && !l.cost_code)) return toast("Pick a cost code for every labor line.", true); b.labor = labor.filter(l => l.cost_code && l.seconds); }
+      if (kind === "labor" || kind === "service") b.cost_code = (b.labor[0] || {}).cost_code || "";
+      if (kind === "package") b.items = items.map(x => ({ item_id: x.item_id, qty: x.qty }));
+      try { await api(id ? `/api/catalog/${id}` : "/api/catalog", { method: id ? "PUT" : "POST", json: b }); d.close(); toast("Saved."); renderCatalog(); } catch (err) { toast(err.message, true); }
+    };
+    const del = async () => { if (!confirm("Delete this item from the catalog?")) return; try { await api(`/api/catalog/${id}`, { method: "DELETE" }); d.close(); toast("Deleted."); renderCatalog(); } catch (err) { toast(err.message, true); } };
+    d.append(h("form", { onsubmit: save },
+      h("header", h("h2", (id ? "Edit " : "New ") + KIND_LABEL[kind].toLowerCase()), h("button.btn.sm", { type: "button", onclick: () => d.close() }, "Close")),
+      h("div.bd",
+        h("div.grid",
+          kind === "product" ? field("Manufacturer", inp("manufacturer")) : null,
+          field(nameLabel, inp("model", { required: true }), kind === "product" ? "" : "span2"),
+          kind === "product" ? field("Part number", inp("part_number")) : null,
+          kind === "product" ? field("Catalog #", inp("catalog_no")) : null,
+          field("Category", inp("category")), field("Subcategory", inp("subcategory")),
+          field("Default system", inp("system", { list: "syslist", placeholder: "Lighting: Can Light" })),
+          kind === "product" ? field("Preferred vendor", inp("vendor")) : null,
+          kind !== "package" && kind !== "labor" ? field("Unit cost", inp("unit_cost", { type: "number", step: "any", min: "0" })) : null,
+          kind !== "package" ? field("Unit sell" + (kind === "labor" ? " (optional)" : ""), inp("unit_price", { type: "number", step: "any", min: "0", placeholder: priceHint ? "at rate" : "" })) : null,
+          kind === "product" ? field("MSRP", inp("msrp", { type: "number", step: "any", min: "0" })) : null,
+          kind === "product" ? field("Order unit", inp("order_uom", { placeholder: "Each, Package, Reel" })) : null,
+          kind === "product" ? field("Units per order", inp("order_units", { type: "number", step: "any", min: "1" })) : null,
+          kind === "product" ? field("Purchase cost (per order unit)", inp("purchase_cost", { type: "number", step: "any", min: "0" })) : null,
+          kind === "product" || kind === "service" ? field("Product URL", inp("url"), "span2") : null,
+          kind === "product" ? field("Image URL", inp("image_url"), "span2") : null,
+          kind === "product" ? h("label", { style: { flexDirection: "row", alignItems: "center", gap: "6px" } }, (f.taxable = h("input", { type: "checkbox", checked: it.taxable })), "Taxable") : null,
+          id ? h("label", { style: { flexDirection: "row", alignItems: "center", gap: "6px" } }, (f.discontinued = h("input", { type: "checkbox", checked: it.discontinued })), "Discontinued") : null),
+        priceHint ? h("p.muted.small", priceHint + ".") : null,
+        kind !== "product" ? h("p.muted.small", kind === "package" ? "Packages aren't taxed themselves; their products are." : "Labor and service items are never taxed.") : null,
+        h("label.fld", { style: { marginTop: "10px" } }, "Description", (f.short_desc = h("textarea", { rows: 2 }, it.short_desc || ""))),
+        kind !== "package" ? [h("div.sec", kind === "labor" ? "Labor" : "Labor per unit"), h("p.muted.small", { style: { margin: "0 0 8px" } },
+          kind === "service" ? "Optional. The cost code also files the charge on the job." : "Time is H:MM:SS. On a bid, each line costs its time times the quantity times that cost code's rate for the bid's division."), laborEditor(labor)] : null,
+        kind === "package" ? [h("div.sec", "Contents"), h("p.muted.small", { style: { margin: "0 0 8px" } }, "Quantities are per package. Placing 9 of this package on a bid places 9 times each part."), packageEditor(items)] : null,
+        sysList),
+      h("footer", id ? h("button.btn.danger", { type: "button", onclick: del }, "Delete") : null, h("span.grow"),
+        h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel"), h("button.btn.pri", "Save"))));
+  });
+}
+
+async function importDialog(file) {
+  const rows = readCsv(await file.text());
+  if (!rows.length || !("Model" in rows[0])) return toast("That file doesn't look like a D-Tools catalog export (no Model column).", true);
+  let dry; try { dry = { added: 0, updated: 0, skipped: 0, noCode: 0, newSystems: 0 }; for (let i = 0; i < rows.length; i += 1000) { const r = await api("/api/catalog/import", { json: { rows: rows.slice(i, i + 1000), dry: true } }); for (const k of ["added", "updated", "skipped", "noCode"]) dry[k] += r[k]; dry.newSystems = Math.max(dry.newSystems, r.newSystems || 0); } }
+  catch (e) { return toast(e.message, true); }
+  dialog(d => {
+    const bar = h("i"), msg = h("p.muted");
+    const go = async e => {
+      e.preventDefault(); e.submitter && (e.submitter.disabled = true);
+      const tot = { added: 0, updated: 0, newSystems: 0 };
+      try { for (let i = 0; i < rows.length; i += 500) { const r = await api("/api/catalog/import", { json: { rows: rows.slice(i, i + 500) } }); tot.added += r.added; tot.updated += r.updated; tot.newSystems += r.newSystems || 0; bar.style.width = Math.min(100, (i + 500) / rows.length * 100) + "%"; msg.textContent = `${Math.min(rows.length, i + 500).toLocaleString()} of ${rows.length.toLocaleString()} rows…`; }
+        SET = await api("/api/settings"); d.close(); toast(`Imported: ${tot.added} new, ${tot.updated} updated.`); CAT.offset = 0; renderCatalog(); }
+      catch (err) { toast(err.message, true); msg.textContent = "Stopped: " + err.message + " Rows before this point were saved; you can run the import again safely."; }
+    };
+    d.append(h("form", { onsubmit: go }, h("header", h("h2", "Import D-Tools catalog")),
+      h("div.bd", h("p", h("b", file.name), ` has ${rows.length.toLocaleString()} rows.`),
+        h("ul", h("li", `${dry.added.toLocaleString()} new products`), h("li", `${dry.updated.toLocaleString()} already in the catalog (matched on manufacturer and model) will be updated`),
+          dry.skipped ? h("li", `${dry.skipped} rows skipped (no model, or listed twice)`) : null,
+          dry.newSystems ? h("li", `${dry.newSystems} systems or subsystems will be added to Settings`) : null,
+          dry.noCode ? h("li", { style: { color: "var(--warn)" } }, `${dry.noCode} products have labor hours but a phase or labor type whose code isn't one of your cost codes or aliases. They'll come in without labor. Add the missing code as an alias in Settings first if you want it.`) : null),
+        h("p.muted.small", "Phases and labor types are matched through your cost code aliases, for example [6020] to 7030 Rough-In. Unit Labor Hours become a labor line in H:M:S. Re-importing later is safe: it updates what's there."),
+        h("div.bar", bar), msg),
+      h("footer", h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel"), h("button.btn.pri", "Import"))));
+  });
+}
+
+// ---------------------------------------------------------------- settings
+async function renderSettings(sub) {
+  SET = await api("/api/settings");
+  const can = ME.settings, ro = can ? null : true;
+  const codes = SET.costCodes.map(c => ({ ...c, rates: { ...c.rates }, aliases: [...(c.aliases || [])] }));
+  const pays = SET.paySchedules.map(p => ({ ...p, steps: p.steps.map(s => ({ ...s })) }));
+  const sys = SET.systems.map(s => ({ ...s, subs: [...s.subs] }));
+  const saveBtn = (label, fn) => can ? h("button.btn.pri.sm", { onclick: async () => { try { await fn(); SET = await api("/api/settings"); toast("Saved."); renderSettings(); } catch (e) { toast(e.message, true); } } }, label) : null;
+
+  // cost codes
+  const codeBody = h("tbody");
+  const drawCodes = () => codeBody.replaceChildren(...codes.map((c, i) => h("tr",
+    h("td", h("input", { value: c.code, style: { width: "80px" }, disabled: ro, onchange: e => c.code = e.target.value.trim() })),
+    h("td", h("input", { value: c.name, style: { width: "100%", minWidth: "160px" }, disabled: ro, onchange: e => c.name = e.target.value })),
+    ...SET.divs.map(dv => h("td.rates", h("input", { type: "number", step: "0.01", min: "0", value: c.rates[dv] || "", placeholder: "0.00", disabled: ro, onchange: e => c.rates[dv] = parseFloat(e.target.value) || 0 }))),
+    h("td", h("input", { value: c.aliases.join(", "), placeholder: "old codes", style: { width: "130px" }, disabled: ro, title: "Old codes that mean this one (D-Tools phases and labor types)", onchange: e => c.aliases = e.target.value.split(/[\s,;]+/).filter(Boolean) })),
+    h("td", h("label.small", { style: { display: "flex", gap: "4px", alignItems: "center" } }, h("input", { type: "checkbox", checked: c.retired, disabled: ro, onchange: e => c.retired = e.target.checked }), "Retired")),
+    can ? h("td", h("button.btn.sm.danger", { onclick: () => { codes.splice(i, 1); drawCodes(); } }, "Remove")) : null)));
+  drawCodes();
+
+  // payment schedules
+  const payBox = h("div");
+  const drawPays = () => payBox.replaceChildren(...pays.map((p, i) => {
+    const tot = Math.round(p.steps.reduce((a, s) => a + (+s.pct || 0), 0) * 100) / 100, totEl = h("span" + (tot === 100 ? ".muted" : ""), { style: tot === 100 ? null : { color: "var(--bad)", fontWeight: 600 } }, `Total ${tot}%`);
+    return h("div.sys",
+      h("div.row", h("input", { value: p.name, placeholder: "Schedule name", style: { flex: "1", fontWeight: 600 }, disabled: ro, onchange: e => p.name = e.target.value }), totEl,
+        can ? h("button.btn.sm.danger", { onclick: () => { pays.splice(i, 1); drawPays(); } }, "Remove schedule") : null),
+      h("table", { style: { marginTop: "6px" } }, h("tbody", p.steps.map((s, j) => h("tr",
+        h("td", h("input", { value: s.label, placeholder: "Milestone", style: { width: "100%" }, disabled: ro, onchange: e => s.label = e.target.value })),
+        h("td", { style: { width: "120px" } }, h("input", { type: "number", step: "0.01", min: "0", max: "100", value: s.pct, style: { width: "80px" }, disabled: ro, onchange: e => { s.pct = parseFloat(e.target.value) || 0; drawPays(); } }), " %"),
+        can ? h("td", { style: { width: "90px" } }, h("button.btn.sm.danger", { onclick: () => { p.steps.splice(j, 1); drawPays(); } }, "Remove")) : null)))),
+      can ? h("button.btn.sm", { onclick: () => { p.steps.push({ label: "", pct: 0 }); drawPays(); } }, "+ Milestone") : null);
+  }));
+  drawPays();
+
+  // systems
+  const sysBox = h("div");
+  const drawSys = () => sysBox.replaceChildren(...sys.map((s, i) => h("div.sys",
+    h("div.row", h("input", { value: s.name, style: { fontWeight: 600, flex: "1" }, disabled: ro, onchange: e => s.name = e.target.value }),
+      can ? h("button.btn.sm.danger", { onclick: () => { sys.splice(i, 1); drawSys(); } }, "Remove") : null),
+    h("div.chips", s.subs.map((x, j) => h("span.chip", x, can ? h("button", { title: "Remove", onclick: () => { s.subs.splice(j, 1); drawSys(); } }, "×") : null)),
+      can ? h("input", { placeholder: "+ Subsystem", style: { width: "150px", minHeight: "28px" }, onkeydown: e => { if (e.key === "Enter" && e.target.value.trim()) { s.subs.push(e.target.value.trim()); drawSys(); } } }) : null))));
+  drawSys();
+
+  // lead numbers
+  const leadIn = {};
+  const leadRows = SET.divs.map(dv => h("div.row", { style: { marginBottom: "8px" } }, h("b", { style: { width: "40px" } }, dv),
+    (leadIn[dv] = h("input", { type: "number", min: SET.leads[dv] || 1, step: "1", value: SET.leads[dv] ?? "", placeholder: "200", style: { width: "120px" }, disabled: ro })),
+    h("span.muted", SET.leads[dv] != null ? `Next number: ${dv}-${String(SET.leads[dv]).padStart(4, "0")}` : "Not set yet. Bids can't create jobs in this division until it is.")));
+
+  show(
+    h("h1", "Settings"),
+    !can ? h("div.note", "Only Admins can change settings. You can see them here.") : null,
+    h("div.card", h("header", h("h2", "Cost codes and labor rates"), saveBtn("Save cost codes", () => api("/api/settings/cost-codes", { method: "PUT", json: { costCodes: codes } }))),
+      h("div.bd", h("p.muted.small", { style: { marginTop: 0 } }, "Labor sells at the rate for the bid's division, with no markup. Aliases are old codes that mean this one, so D-Tools imports land on the right code. A code used in the catalog can be retired but not removed."),
+        h("div.wrap", h("table", h("thead", h("tr", h("th", "Code"), h("th", "Name"), ...SET.divs.map(dv => h("th", `${dv} rate ($/hr)`)), h("th", "Aliases"), h("th", ""), can ? h("th") : null)), codeBody)),
+        can ? h("button.btn.sm", { style: { marginTop: "8px" }, onclick: () => { codes.push({ code: "", name: "", rates: {}, aliases: [], retired: false }); drawCodes(); } }, "+ Cost code") : null)),
+    h("div.card", h("header", h("h2", "Payment schedules"), saveBtn("Save schedules", () => api("/api/settings/pay-schedules", { method: "PUT", json: { paySchedules: pays } }))),
+      h("div.bd", h("p.muted.small", { style: { marginTop: 0 } }, "Each bid picks one of these, and can change its milestones for that bid only. Milestones must total 100%."), payBox,
+        can ? h("button.btn.sm", { onclick: () => { pays.push({ name: "", steps: [{ label: "", pct: 100 }] }); drawPays(); } }, "+ Payment schedule") : null)),
+    h("div.card", h("header", h("h2", "Lead numbers"), saveBtn("Save lead numbers", () => api("/api/settings/leads", { method: "PUT", json: { leads: Object.fromEntries(SET.divs.map(dv => [dv, leadIn[dv].value])) } }))),
+      h("div.bd", h("p.muted.small", { style: { marginTop: 0 } }, "A new job gets the next number in its division, like EL-0200 or LV-0200. The next number can only move forward, so no lead number is ever used twice."), leadRows)),
+    h("div.card", h("header", h("h2", "Systems"), saveBtn("Save systems", () => api("/api/settings/systems", { method: "PUT", json: { systems: sys } }))),
+      h("div.bd", h("p.muted.small", { style: { marginTop: 0 } }, "A system and its subsystems, like Lighting with Can Light and Tape Light. The D-Tools import adds any it finds. Type a subsystem and press Enter."), sysBox,
+        can ? h("button.btn.sm", { onclick: () => { sys.push({ name: "New system", subs: [] }); drawSys(); } }, "+ System") : null)));
+}
+
+// ---------------------------------------------------------------- start
+(async () => {
+  try {
+    const r = await api("/api/me"); ME = r.me; SET = await api("/api/settings");
+    document.getElementById("who").textContent = ME.name;
+    if (r.sisTools) { const a = document.getElementById("sis"); a.href = r.sisTools; a.hidden = false; }
+    route();
+  } catch (e) { show(h("div.note.bad", e.message)); }
+})();
