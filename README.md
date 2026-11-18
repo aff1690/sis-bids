@@ -12,7 +12,10 @@ This build covers step 1 of the spec:
 - **D-Tools catalog import:** loads your SI catalog export. It was tested on `Products Nov 18 2026` (2,673 products,
   about 0.6 s). Phases and labor types map through the aliases, for example `[6020]` to 7030 Rough-In.
 
-The Bids tab shows a placeholder until build B2, which adds bids, the room tree and the takeoff.
+**Bids (build B2a):** start a bid from a new lead job (it takes the next EL-/LV- lead number and makes the job in SIS Tools) or an
+existing SIS Tools job. Each bid has a room tree (level › room › sub-room), items placed in rooms under systems, live totals
+(equipment, services, labor at the division rate, tax on materials only), views by room, system and cost code, a payment
+schedule that can be changed per bid, revisions, and one active bid per job. Build B2b moves the Electrical Takeoff in.
 
 ## Deploy (Workers Builds from GitHub)
 
@@ -59,6 +62,9 @@ New tables, all created on first use:
 | `bid_catalog_labor` | Labor lines in seconds, per cost code |
 | `bid_package_items` | Package contents |
 | `bid_lead_counters` | The next lead number per division |
+| `bids` | One row per bid revision, tied to a SIS Tools job |
+| `bid_rooms` | Each bid's room tree |
+| `bid_lines` | Items in a bid, with prices and labor copied from the catalog when added |
 
 Settings live in SIS Tools' `settings` table under the keys `bids:costCodes`, `bids:paySchedules` and `bids:systems`.
 Nothing that SIS Tools already stores is changed.

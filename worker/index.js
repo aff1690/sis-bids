@@ -97,6 +97,7 @@ async function init(db) {
     db.prepare("CREATE INDEX IF NOT EXISTS bid_package_items_item ON bid_package_items (item_id)"),
     db.prepare("CREATE TABLE IF NOT EXISTS bid_lead_counters (div TEXT PRIMARY KEY, next INTEGER NOT NULL)"),
   ]);
+  await initBids(db);
   ready = true;
 }
 
@@ -390,6 +391,269 @@ async function catalogApi(req, env, url, me) {
 }
 
 // ---------------------------------------------------------------- the Worker
+// ---------------------------------------------------------------- bids (B2a)
+// A bid belongs to a SIS Tools job (docs coll "jobs"). A job is made here with the next lead number (EL-0200 / LV-0200) when
+// a lead asks for a price, or an existing job is picked. Each bid has its own room tree (level > room > sub-room, as deep as
+// three) and lines: a catalog item placed in one room under one system, with a quantity. A line copies cost, sell, tax base and
+// labor from the catalog when it's added (a package copies its rolled-up totals and its contents), so later catalog changes
+// never move a bid's numbers; "Update prices" pulls them again on purpose.
+const DIV_NAME = { EL: "Electrical", LV: "Low Voltage" };
+const DIV_OF = name => /low\s*volt/i.test(name || "") ? "LV" : "EL";
+const BID_STATUS = ["draft", "sent", "won", "lost"];
+async function initBids(db) {
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS bids (id INTEGER PRIMARY KEY, job_id TEXT NOT NULL, name TEXT DEFAULT '', rev INTEGER DEFAULT 1, status TEXT DEFAULT 'draft',
+      active INTEGER DEFAULT 1, div TEXT DEFAULT 'EL', margin_pct REAL, tax_pct REAL DEFAULT 0, pay_id TEXT DEFAULT '', pay_steps TEXT DEFAULT '[]', notes TEXT DEFAULT '',
+      totals TEXT DEFAULT '{}', created_at TEXT, created_by TEXT DEFAULT '', updated_at TEXT, updated_by TEXT DEFAULT '')`),
+    db.prepare("CREATE INDEX IF NOT EXISTS bids_job ON bids (job_id)"),
+    db.prepare("CREATE TABLE IF NOT EXISTS bid_rooms (id INTEGER PRIMARY KEY, bid_id INTEGER NOT NULL, parent_id INTEGER, name TEXT NOT NULL, sort REAL DEFAULT 0)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS bid_rooms_bid ON bid_rooms (bid_id)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS bid_lines (id INTEGER PRIMARY KEY, bid_id INTEGER NOT NULL, room_id INTEGER, system TEXT DEFAULT '', item_id INTEGER, kind TEXT DEFAULT 'product',
+      manufacturer TEXT DEFAULT '', model TEXT DEFAULT '', part_number TEXT DEFAULT '', description TEXT DEFAULT '', qty REAL DEFAULT 1, unit_cost REAL DEFAULT 0, unit_price REAL,
+      tax_base REAL DEFAULT 0, labor TEXT DEFAULT '[]', contents TEXT DEFAULT '[]', sort REAL DEFAULT 0, source TEXT DEFAULT 'manual', src_key TEXT DEFAULT '', note TEXT DEFAULT '')`),
+    db.prepare("CREATE INDEX IF NOT EXISTS bid_lines_bid ON bid_lines (bid_id, room_id)"),
+  ]);
+}
+const nowIso = () => new Date().toISOString();
+const uid36 = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+// SIS Tools jobs, read straight from its docs table
+async function sisJobs(env) {
+  const { results } = await env.DB.prepare("SELECT id, data FROM docs WHERE coll = 'jobs'").all().catch(() => ({ results: [] }));
+  const out = []; for (const r of results || []) { const j = parse(r.data); if (!j || j.deleted || j.status === "deleted") continue;
+    out.push({ id: r.id, no: j.no || "", lead: j.lead || "", name: j.name || "", div: j.div || "", addr: j.addr || "", contact: j.contact || "", status: j.status || "active", kind: j.kind || "" }); }
+  return out;
+}
+async function sisJob(env, id) { const r = await env.DB.prepare("SELECT data FROM docs WHERE coll = 'jobs' AND id = ?").bind(id).first().catch(() => null); const j = r ? parse(r.data) : null;
+  return j && !j.deleted ? { id, no: j.no || "", lead: j.lead || "", name: j.name || "", div: j.div || "", addr: j.addr || "", contact: j.contact || "", status: j.status || "active" } : null; }
+// a new job in SIS Tools, logged in its history the way SIS Tools logs its own saves (who, when, before and after)
+async function createJob(env, me, b) {
+  const div = DIVS.includes(b.div) ? b.div : "", name = str(b.name, 120);
+  if (!div) return bad("Pick a division."); if (!name) return bad("Enter the job name.");
+  const lead = await takeLead(env, div).catch(e => e); if (lead instanceof Error) return bad(lead.message);
+  const id = uid36(), now = new Date(), at = now.getTime();
+  const job = { no: lead, lead, name, div: DIV_NAME[div], addr: str(b.addr, 200), contact: str(b.contact, 120), phone: str(b.phone, 40), status: "active", color: 7, notes: str(b.notes, 1000), from: "sis-bids", by: me.email, at };
+  const h = { at, by: me.email, name: me.name, role: me.role, coll: "jobs", docId: id, before: null, after: job };
+  await env.DB.batch([
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS docs (coll TEXT NOT NULL, id TEXT NOT NULL, date TEXT, data TEXT NOT NULL, updated TEXT NOT NULL, PRIMARY KEY (coll, id))"),
+    env.DB.prepare("INSERT INTO docs (coll, id, date, data, updated) VALUES ('jobs', ?, NULL, ?, ?)").bind(id, JSON.stringify(job), now.toISOString()),
+    env.DB.prepare("INSERT INTO docs (coll, id, date, data, updated) VALUES ('history', ?, ?, ?, ?)").bind(at + "_" + crypto.randomUUID().slice(0, 8), now.toISOString().slice(0, 10), JSON.stringify(h), now.toISOString()),
+  ]);
+  return { id, no: lead, lead, name, div: job.div, addr: job.addr, contact: job.contact, status: "active" };
+}
+
+// the money: equipment and services at their sell, labor at the bid division's rate per cost code (no markup), tax on taxable sell
+function bidTotals(bid, lines, codes) {
+  const rate = {}; for (const c of codes) rate[c.code] = (c.rates || {})[bid.div] || 0;
+  const t = { equipCost: 0, equipSell: 0, svcCost: 0, svcSell: 0, laborSell: 0, laborSecs: 0, taxBase: 0, byCode: {}, byRoom: {}, bySystem: {}, missingRate: [] };
+  const add = (o, k, f) => { const x = o[k] || (o[k] = { sell: 0, cost: 0, labor: 0, secs: 0 }); f(x); };
+  for (const l of lines) {
+    const q = l.qty || 0, lab = Array.isArray(l.labor) ? l.labor : parse(l.labor) || [];
+    let laborUSD = 0, secs = 0;
+    for (const x of lab) { const s = (x.seconds || 0) * q; secs += s; const r = rate[x.cost_code] || 0; if (!r && s && !t.missingRate.includes(x.cost_code)) t.missingRate.push(x.cost_code);
+      const usd = l.kind === "labor" && l.unit_price != null ? 0 : s / 3600 * r; laborUSD += usd;
+      add(t.byCode, x.cost_code, o => { o.secs += s; o.labor += usd; }); }
+    let sell = 0, cost = q * (l.unit_cost || 0);
+    if (l.kind === "labor") { if (l.unit_price != null) { laborUSD += q * l.unit_price; const c0 = (lab[0] || {}).cost_code || l.cost_code || ""; add(t.byCode, c0, o => { o.labor += q * l.unit_price; }); } cost = 0; }
+    else sell = q * (l.unit_price == null ? 0 : l.unit_price);
+    if (l.kind === "service") { t.svcCost += cost; t.svcSell += sell; } else if (l.kind !== "labor") { t.equipCost += cost; t.equipSell += sell; }
+    t.laborSell += laborUSD; t.laborSecs += secs; t.taxBase += q * (l.tax_base || 0);
+    const rk = String(l.room_id || 0); add(t.byRoom, rk, o => { o.sell += sell + laborUSD; o.cost += cost; o.labor += laborUSD; o.secs += secs; });
+    add(t.bySystem, l.system || "", o => { o.sell += sell + laborUSD; o.cost += cost; o.labor += laborUSD; o.secs += secs; });
+  }
+  t.tax = r2(t.taxBase * (bid.tax_pct || 0) / 100);
+  t.total = r2(t.equipSell + t.svcSell + t.laborSell + t.tax);
+  t.cost = r2(t.equipCost + t.svcCost);
+  t.margin = t.equipSell + t.svcSell > 0 ? r2((t.equipSell + t.svcSell - t.cost) / (t.equipSell + t.svcSell) * 100) : 0;
+  for (const k of ["equipCost", "equipSell", "svcCost", "svcSell", "laborSell", "taxBase"]) t[k] = r2(t[k]);
+  return t;
+}
+const outBid = b => ({ ...b, active: !!b.active, pay_steps: parse(b.pay_steps) || [], totals: parse(b.totals) || {} });
+const outLine = l => ({ ...l, labor: parse(l.labor) || [], contents: parse(l.contents) || [] });
+async function loadBid(env, id) {
+  const bid = await env.DB.prepare("SELECT * FROM bids WHERE id = ?").bind(id).first(); if (!bid) return null;
+  const rooms = (await env.DB.prepare("SELECT * FROM bid_rooms WHERE bid_id = ? ORDER BY sort, id").bind(id).all()).results || [];
+  const lines = ((await env.DB.prepare("SELECT * FROM bid_lines WHERE bid_id = ? ORDER BY sort, id").bind(id).all()).results || []).map(outLine);
+  return { bid: outBid(bid), rooms, lines };
+}
+// keep the bid's cached totals (shown in lists) current after every change
+async function touch(env, me, id) {
+  const d = await loadBid(env, id); if (!d) return null;
+  const t = bidTotals(d.bid, d.lines, await costCodes(env));
+  const sum = { total: t.total, equipSell: t.equipSell, laborSell: t.laborSell, laborSecs: t.laborSecs, tax: t.tax, lines: d.lines.length };
+  await env.DB.prepare("UPDATE bids SET totals = ?, updated_at = ?, updated_by = ? WHERE id = ?").bind(JSON.stringify(sum), nowIso(), me.email, id).run();
+  return d;
+}
+// a catalog item -> the values a new line copies
+async function lineFromItem(env, itemId, bid) {
+  const it = await env.DB.prepare("SELECT * FROM bid_catalog WHERE id = ?").bind(itemId).first(); if (!it) return null;
+  const o = { item_id: it.id, kind: it.kind, manufacturer: it.manufacturer, model: it.model, part_number: it.part_number, description: it.short_desc, system: it.system, unit_cost: it.unit_cost || 0, unit_price: it.unit_price, tax_base: 0, labor: [], contents: [] };
+  if (it.kind === "package") {
+    const ru = (await rollup(env, [it.id]))[it.id] || {};
+    o.unit_cost = ru.cost || 0; o.unit_price = ru.price || 0; o.tax_base = ru.taxable || 0;
+    o.labor = Object.entries(ru.labor || {}).map(([cost_code, seconds]) => ({ cost_code, seconds }));
+    const { results } = await env.DB.prepare("SELECT p.qty, c.manufacturer, c.model, c.part_number, c.short_desc FROM bid_package_items p JOIN bid_catalog c ON c.id = p.item_id WHERE p.pkg_id = ? ORDER BY p.n").bind(it.id).all();
+    o.contents = (results || []).map(r => ({ qty: r.qty, manufacturer: r.manufacturer, model: r.model, part_number: r.part_number, description: r.short_desc }));
+  } else {
+    o.labor = (await laborOf(env, [it.id]))[it.id] || [];
+    if (it.kind === "product" && bid.margin_pct != null && (it.unit_price == null || it.unit_price === 0) && it.unit_cost) o.unit_price = r4(it.unit_cost / (1 - bid.margin_pct / 100));
+    if (it.kind === "product" && it.taxable) o.tax_base = o.unit_price || 0;
+  }
+  if (it.kind !== "labor" && o.unit_price == null) o.unit_price = 0;
+  return o;
+}
+const LINE_COLS = ["bid_id", "room_id", "system", "item_id", "kind", "manufacturer", "model", "part_number", "description", "qty", "unit_cost", "unit_price", "tax_base", "labor", "contents", "sort", "source", "src_key", "note"];
+const insLine = (env, o) => env.DB.prepare(`INSERT INTO bid_lines (${LINE_COLS.join(", ")}) VALUES (${LINE_COLS.map(() => "?").join(", ")})`)
+  .bind(...LINE_COLS.map(c => c === "labor" || c === "contents" ? JSON.stringify(o[c] || []) : o[c] === undefined ? (c === "qty" ? 1 : c === "sort" ? Date.now() : c === "room_id" || c === "item_id" || c === "unit_price" ? null : "") : o[c]));
+
+async function bidsApi(req, env, url, me) {
+  const p = url.pathname, M = req.method;
+  const body = async () => (await req.json().catch(() => null)) || {};
+  if (p === "/api/jobs" && M === "GET") {
+    const q = str(url.searchParams.get("q"), 80).toLowerCase(), jobs = await sisJobs(env);
+    const counts = Object.fromEntries((((await env.DB.prepare("SELECT job_id, COUNT(*) AS n FROM bids GROUP BY job_id").all()).results) || []).map(r => [r.job_id, r.n]));
+    const words = q.split(/\s+/).filter(Boolean);
+    const list = jobs.filter(j => j.kind !== "wo" && (!words.length || words.every(w => `${j.no} ${j.lead} ${j.name} ${j.addr}`.toLowerCase().includes(w))))
+      .map(j => ({ ...j, bids: counts[j.id] || 0 })).sort((a, b) => (b.bids - a.bids) || String(b.no).localeCompare(String(a.no), undefined, { numeric: true })).slice(0, 60);
+    return json({ jobs: list });
+  }
+  if (p === "/api/jobs" && M === "POST") { const r = await createJob(env, me, await body()); return r instanceof Response ? r : json({ ok: true, job: r }); }
+  if (p === "/api/bids" && M === "GET") {
+    const job = url.searchParams.get("job");
+    const { results } = job ? await env.DB.prepare("SELECT * FROM bids WHERE job_id = ? ORDER BY rev DESC, id DESC").bind(job).all()
+      : await env.DB.prepare("SELECT * FROM bids ORDER BY updated_at DESC LIMIT 200").all();
+    const jobs = Object.fromEntries((await sisJobs(env)).map(j => [j.id, j]));
+    return json({ bids: (results || []).map(b => ({ ...outBid(b), job: jobs[b.job_id] || null })) });
+  }
+  if (p === "/api/bids" && M === "POST") {
+    const b = await body(), job = await sisJob(env, str(b.job_id, 60)); if (!job) return bad("Pick a job first.");
+    const prev = await env.DB.prepare("SELECT MAX(rev) AS r FROM bids WHERE job_id = ?").bind(job.id).first(), rev = ((prev && prev.r) || 0) + 1;
+    const pays = await paySchedules(env), pay = pays.find(x => x.id === b.pay_id) || pays[0] || { id: "", steps: [] };
+    const src = b.copy_from ? await loadBid(env, Math.floor(numOr(b.copy_from))) : null;
+    const base = src ? src.bid : { div: DIV_OF(job.div), margin_pct: null, tax_pct: 0, pay_id: pay.id, pay_steps: pay.steps, notes: "" };
+    const now = nowIso();
+    const r = await env.DB.prepare(`INSERT INTO bids (job_id, name, rev, status, active, div, margin_pct, tax_pct, pay_id, pay_steps, notes, created_at, created_by, updated_at, updated_by)
+      VALUES (?, ?, ?, 'draft', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`).bind(job.id, str(b.name, 120) || (src ? `${src.bid.name || "Bid"} (copy)` : "Base bid"), rev, base.div, base.margin_pct, base.tax_pct || 0,
+      base.pay_id || "", JSON.stringify(base.pay_steps || []), base.notes || "", now, me.email, now, me.email).first();
+    const id = r.id;
+    await env.DB.prepare("UPDATE bids SET active = 0 WHERE job_id = ? AND id <> ?").bind(job.id, id).run(); // the newest bid is the job's active one until someone picks another
+    if (src) { // copy the room tree and lines
+      const map = {}, order = []; const byParent = {}; for (const rm of src.rooms) (byParent[rm.parent_id || 0] ||= []).push(rm);
+      const walk = pid => { for (const rm of byParent[pid] || []) { order.push(rm); walk(rm.id); } }; walk(0);
+      for (const rm of order) { const x = await env.DB.prepare("INSERT INTO bid_rooms (bid_id, parent_id, name, sort) VALUES (?, ?, ?, ?) RETURNING id").bind(id, rm.parent_id ? map[rm.parent_id] : null, rm.name, rm.sort).first(); map[rm.id] = x.id; }
+      const stmts = src.lines.map(l => insLine(env, { ...l, bid_id: id, room_id: l.room_id ? map[l.room_id] || null : null }));
+      for (let i = 0; i < stmts.length; i += 200) await env.DB.batch(stmts.slice(i, i + 200));
+    }
+    await touch(env, me, id);
+    return json({ ok: true, id });
+  }
+  let m = p.match(/^\/api\/bids\/(\d+)(\/.*)?$/);
+  if (m) {
+    const id = Number(m[1]), sub = m[2] || "";
+    const bid = await env.DB.prepare("SELECT * FROM bids WHERE id = ?").bind(id).first(); if (!bid) return bad("That bid is gone.", 404);
+    if (!sub && M === "GET") { const d = await loadBid(env, id); return json({ ...d, job: await sisJob(env, bid.job_id), totals: bidTotals(d.bid, d.lines, await costCodes(env)) }); }
+    if (!sub && M === "PUT") {
+      const b = await body(), set = {};
+      if ("name" in b) set.name = str(b.name, 120);
+      if ("status" in b && BID_STATUS.includes(b.status)) set.status = b.status;
+      if ("div" in b && DIVS.includes(b.div)) set.div = b.div;
+      if ("margin_pct" in b) set.margin_pct = b.margin_pct === null || b.margin_pct === "" ? null : Math.min(95, Math.max(0, numOr(b.margin_pct)));
+      if ("tax_pct" in b) set.tax_pct = Math.min(30, Math.max(0, numOr(b.tax_pct)));
+      if ("notes" in b) set.notes = str(b.notes, 4000);
+      if ("pay_id" in b) { const s = (await paySchedules(env)).find(x => x.id === b.pay_id); if (s) { set.pay_id = s.id; set.pay_steps = JSON.stringify(s.steps); } }
+      if ("pay_steps" in b) { const st = (Array.isArray(b.pay_steps) ? b.pay_steps : []).slice(0, 20).map(x => ({ label: str(x.label, 80), pct: r2(numOr(x.pct)) }));
+        const tot = r2(st.reduce((a, x) => a + x.pct, 0)); if (st.length && Math.abs(tot - 100) > 0.001) return bad(`The milestones add up to ${tot}%. They must total 100%.`); set.pay_steps = JSON.stringify(st); }
+      if (b.active === true) { await env.DB.prepare("UPDATE bids SET active = 0 WHERE job_id = ?").bind(bid.job_id).run(); set.active = 1; }
+      const ks = Object.keys(set); if (ks.length) await env.DB.prepare(`UPDATE bids SET ${ks.map(k => k + " = ?").join(", ")} WHERE id = ?`).bind(...ks.map(k => set[k]), id).run();
+      await touch(env, me, id); return json({ ok: true });
+    }
+    if (!sub && M === "DELETE") {
+      await env.DB.batch([env.DB.prepare("DELETE FROM bid_lines WHERE bid_id = ?").bind(id), env.DB.prepare("DELETE FROM bid_rooms WHERE bid_id = ?").bind(id), env.DB.prepare("DELETE FROM bids WHERE id = ?").bind(id)]);
+      return json({ ok: true });
+    }
+    // rooms: {parent_id, name} or {parent_id, names: [...]} (paste a list, one per line)
+    if (sub === "/rooms" && M === "POST") {
+      const b = await body(), pid = b.parent_id ? Math.floor(numOr(b.parent_id)) : null;
+      if (pid) { const par = await env.DB.prepare("SELECT id, parent_id FROM bid_rooms WHERE id = ? AND bid_id = ?").bind(pid, id).first(); if (!par) return bad("That room is gone.");
+        if (par.parent_id) { const gp = await env.DB.prepare("SELECT parent_id FROM bid_rooms WHERE id = ?").bind(par.parent_id).first(); if (gp && gp.parent_id) return bad("Rooms go three levels deep: level, room, sub-room."); } }
+      const names = (Array.isArray(b.names) ? b.names : [b.name]).map(x => str(x, 120)).filter(Boolean).slice(0, 200); if (!names.length) return bad("Enter a name.");
+      const base = Date.now(); await env.DB.batch(names.map((n, i) => env.DB.prepare("INSERT INTO bid_rooms (bid_id, parent_id, name, sort) VALUES (?, ?, ?, ?)").bind(id, pid, n, base + i)));
+      await touch(env, me, id); return json({ ok: true });
+    }
+    if (sub === "/lines" && M === "POST") {
+      const b = await body(), items = Array.isArray(b.items) ? b.items : [b]; const stmts = [];
+      for (const x of items.slice(0, 200)) {
+        const o = await lineFromItem(env, Math.floor(numOr(x.item_id)), bid); if (!o) return bad("That catalog item is gone.");
+        o.bid_id = id; o.room_id = x.room_id ? Math.floor(numOr(x.room_id)) : null; o.qty = Math.max(0, numOr(x.qty, 1)); if (x.system) o.system = str(x.system, 120);
+        stmts.push(insLine(env, o));
+      }
+      await env.DB.batch(stmts); await touch(env, me, id); return json({ ok: true });
+    }
+    // several lines at once: {ids, room_id?, system?, delete?, qty?}
+    if (sub === "/lines/bulk" && M === "POST") {
+      const b = await body(), ids = (Array.isArray(b.ids) ? b.ids : []).map(x => Math.floor(numOr(x))).filter(x => x > 0).slice(0, 2000); if (!ids.length) return bad("Pick some lines.");
+      const ph = ids.map(() => "?").join(",");
+      if (b.delete) await env.DB.prepare(`DELETE FROM bid_lines WHERE bid_id = ? AND id IN (${ph})`).bind(id, ...ids).run();
+      else { const set = []; const args = [];
+        if ("room_id" in b) { set.push("room_id = ?"); args.push(b.room_id ? Math.floor(numOr(b.room_id)) : null); }
+        if ("system" in b) { set.push("system = ?"); args.push(str(b.system, 120)); }
+        if (b.copy_to_rooms) { // copy the picked lines into other rooms
+          const rows = ((await env.DB.prepare(`SELECT * FROM bid_lines WHERE bid_id = ? AND id IN (${ph})`).bind(id, ...ids).all()).results || []).map(outLine), st = [];
+          for (const rid of b.copy_to_rooms.slice(0, 200)) for (const l of rows) st.push(insLine(env, { ...l, room_id: Math.floor(numOr(rid)) || null, sort: Date.now(), source: "manual", src_key: "" }));
+          for (let i = 0; i < st.length; i += 200) await env.DB.batch(st.slice(i, i + 200)); }
+        if (set.length) await env.DB.prepare(`UPDATE bid_lines SET ${set.join(", ")} WHERE bid_id = ? AND id IN (${ph})`).bind(...args, id, ...ids).run(); }
+      await touch(env, me, id); return json({ ok: true });
+    }
+    // pull current catalog prices and labor into every line that came from the catalog (or reprice at the bid's margin)
+    if (sub === "/refresh" && M === "POST") {
+      const b = await body(); if ("margin_pct" in b) await env.DB.prepare("UPDATE bids SET margin_pct = ? WHERE id = ?").bind(b.margin_pct === null || b.margin_pct === "" ? null : Math.min(95, Math.max(0, numOr(b.margin_pct))), id).run();
+      const bid2 = await env.DB.prepare("SELECT * FROM bids WHERE id = ?").bind(id).first();
+      const lines = (await env.DB.prepare("SELECT * FROM bid_lines WHERE bid_id = ? AND item_id IS NOT NULL").bind(id).all()).results || [], st = [];
+      let n = 0;
+      for (const l of lines) { const o = await lineFromItem(env, l.item_id, bid2); if (!o) continue; n++;
+        if (b.at_margin && bid2.margin_pct != null && (o.kind === "product" || o.kind === "package") && o.unit_cost) { const s = r4(o.unit_cost / (1 - bid2.margin_pct / 100)); if (o.kind === "product" && o.tax_base) o.tax_base = s; else if (o.unit_price) o.tax_base = r4(o.tax_base * s / o.unit_price); o.unit_price = s; }
+        st.push(env.DB.prepare("UPDATE bid_lines SET unit_cost = ?, unit_price = ?, tax_base = ?, labor = ?, contents = ? WHERE id = ?").bind(o.unit_cost, o.unit_price, o.tax_base, JSON.stringify(o.labor), JSON.stringify(o.contents), l.id)); }
+      for (let i = 0; i < st.length; i += 200) await env.DB.batch(st.slice(i, i + 200));
+      await touch(env, me, id); return json({ ok: true, updated: n });
+    }
+  }
+  m = p.match(/^\/api\/rooms\/(\d+)$/);
+  if (m) {
+    const rid = Number(m[1]), rm = await env.DB.prepare("SELECT * FROM bid_rooms WHERE id = ?").bind(rid).first(); if (!rm) return bad("That room is gone.", 404);
+    if (M === "PUT") { const b = await body();
+      if ("name" in b) { const n = str(b.name, 120); if (!n) return bad("Enter a name."); await env.DB.prepare("UPDATE bid_rooms SET name = ? WHERE id = ?").bind(n, rid).run(); }
+      if ("sort" in b) await env.DB.prepare("UPDATE bid_rooms SET sort = ? WHERE id = ?").bind(numOr(b.sort), rid).run();
+      await touch(env, me, rm.bid_id); return json({ ok: true }); }
+    if (M === "DELETE") { // the room, its sub-rooms and their lines
+      const all = (await env.DB.prepare("SELECT id, parent_id FROM bid_rooms WHERE bid_id = ?").bind(rm.bid_id).all()).results || [], kill = new Set([rid]);
+      for (let k = 0; k < 3; k++) for (const r of all) if (kill.has(r.parent_id)) kill.add(r.id);
+      const ids = [...kill], ph = ids.map(() => "?").join(",");
+      await env.DB.batch([env.DB.prepare(`DELETE FROM bid_lines WHERE room_id IN (${ph})`).bind(...ids), env.DB.prepare(`DELETE FROM bid_rooms WHERE id IN (${ph})`).bind(...ids)]);
+      await touch(env, me, rm.bid_id); return json({ ok: true }); }
+  }
+  m = p.match(/^\/api\/lines\/(\d+)$/);
+  if (m) {
+    const lid = Number(m[1]), l = await env.DB.prepare("SELECT * FROM bid_lines WHERE id = ?").bind(lid).first(); if (!l) return bad("That line is gone.", 404);
+    if (M === "PUT") { const b = await body(), set = {};
+      if ("qty" in b) set.qty = Math.max(0, numOr(b.qty));
+      if ("unit_price" in b) { const v = b.unit_price === null || b.unit_price === "" ? (l.kind === "labor" ? null : 0) : r4(Math.max(0, numOr(b.unit_price)));
+        set.unit_price = v;
+        if (l.kind === "product") { const it = l.item_id ? await env.DB.prepare("SELECT taxable FROM bid_catalog WHERE id = ?").bind(l.item_id).first() : null;
+          set.tax_base = (l.tax_base > 0 || (it ? it.taxable : !l.item_id)) ? (v || 0) : 0; }
+        else if (l.tax_base && l.unit_price) set.tax_base = v == null ? 0 : r4(l.tax_base * v / l.unit_price); }
+      if ("unit_cost" in b) set.unit_cost = r4(Math.max(0, numOr(b.unit_cost)));
+      if ("system" in b) set.system = str(b.system, 120);
+      if ("room_id" in b) set.room_id = b.room_id ? Math.floor(numOr(b.room_id)) : null;
+      if ("description" in b) set.description = str(b.description, 1000);
+      if ("note" in b) set.note = str(b.note, 1000);
+      if ("labor" in b) set.labor = JSON.stringify(cleanLabor(b.labor));
+      const ks = Object.keys(set); if (ks.length) await env.DB.prepare(`UPDATE bid_lines SET ${ks.map(k => k + " = ?").join(", ")} WHERE id = ?`).bind(...ks.map(k => set[k]), lid).run();
+      await touch(env, me, l.bid_id); return json({ ok: true }); }
+    if (M === "DELETE") { await env.DB.prepare("DELETE FROM bid_lines WHERE id = ?").bind(lid).run(); await touch(env, me, l.bid_id); return json({ ok: true }); }
+  }
+  return null;
+}
+
 function msgPage(text, status) {
   return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SIS Bids</title>
 <style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f1f0ec;color:#1b2027;font:15px/1.45 system-ui,sans-serif;padding:16px}div{max-width:420px;background:#fff;border:1px solid #dedbd3;border-radius:12px;padding:20px}
@@ -423,6 +687,7 @@ export default {
         if (url.pathname === "/api/me") return json({ me, sisTools: "https://" + (env.SIS_TOOLS_HOST || "sistools.thefhouse.net") });
         if (url.pathname.startsWith("/api/settings")) { const r = await settingsApi(req, env, url, me); if (r) return r; }
         if (url.pathname.startsWith("/api/catalog")) { const r = await catalogApi(req, env, url, me); if (r) return r; }
+        if (/^\/api\/(jobs|bids|rooms|lines)(\/|$)/.test(url.pathname)) { const r = await bidsApi(req, env, url, me); if (r) return r; }
         return bad("Not found", 404);
       }
       const res = await env.ASSETS.fetch(req), out = new Response(res.body, res);

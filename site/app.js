@@ -1,4 +1,4 @@
-// SIS Bids page (step 1: catalog and settings). Plain modules, no build step.
+// SIS Bids page: bids, catalog and settings. Plain modules, no build step.
 const app = document.getElementById("app");
 const show = (...kids) => app.replaceChildren(...kids.flat().filter(k => k != null && k !== false));
 let ME = null, SET = null; // signed-in person; settings (cost codes, pay schedules, systems, lead numbers)
@@ -6,7 +6,7 @@ let ME = null, SET = null; // signed-in person; settings (cost codes, pay schedu
 // ---------------------------------------------------------------- helpers
 function h(tag, attrs, ...kids) {
   const [t, ...cls] = tag.split("."); const el = document.createElement(t || "div"); if (cls.length) el.className = cls.join(" ");
-  if (attrs && (typeof attrs !== "object" || attrs instanceof Node || Array.isArray(attrs))) { kids.unshift(attrs); attrs = null; }
+  if (attrs != null && (typeof attrs !== "object" || attrs instanceof Node || Array.isArray(attrs))) { kids.unshift(attrs); attrs = null; }
   for (const [k, v] of Object.entries(attrs || {})) {
     if (v == null || v === false) continue;
     if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
@@ -57,19 +57,287 @@ function readCsv(text) {
 
 // ---------------------------------------------------------------- routes
 async function route() {
-  const [, sec = "catalog", sub] = location.hash.replace(/^#\/?/, "#/").split("/");
+  const [, sec = "bids", sub] = location.hash.replace(/^#\/?/, "#/").split("/");
   document.querySelectorAll("#nav a,.sis-set").forEach(a => a.classList.toggle("on", a.dataset.r === sec));
   try {
     if (sec === "settings") return await renderSettings(sub);
-    if (sec === "bids") return renderBidsSoon();
+    if (sec === "bids") return sub && /^\d+$/.test(sub) ? await renderBid(+sub) : await renderBids();
     return await renderCatalog();
   } catch (e) { show(h("div.note.bad", e.message)); }
 }
 window.addEventListener("hashchange", route);
 
-function renderBidsSoon() {
-  show(h("h1", "Bids"), h("div.note", "Bids, the room tree and the takeoff arrive in the next build. Set up your cost code rates, payment schedules and lead numbers in ",
-    h("a", { href: "#/settings" }, "Settings"), " and load your catalog in ", h("a", { href: "#/catalog" }, "Catalog"), " so they're ready."));
+// ---------------------------------------------------------------- bids (B2a)
+const fill = (el, ...kids) => el.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false));
+const STATUS_LABEL = { draft: "Draft", sent: "Sent", won: "Won", lost: "Lost" };
+const DIV_LABEL = { EL: "Electrical", LV: "Low Voltage" };
+const hrs = s => (s / 3600).toLocaleString("en-US", { maximumFractionDigits: 1 }) + " h";
+const leadText = dv => SET.leads[dv] != null ? `${dv}-${String(SET.leads[dv]).padStart(4, "0")}` : "";
+function sysOptions(extra) {
+  const o = []; for (const s of SET.systems || []) { o.push(s.name); for (const sub of s.subs || []) o.push(`${s.name}: ${sub}`); }
+  for (const x of extra || []) if (x && !o.includes(x)) o.push(x); return o;
+}
+// a small dialog that asks for one value; resolves with the text, or null on Cancel
+function ask(title, label, value = "", opts = {}) {
+  return new Promise(res => dialog(d => {
+    const inp = opts.multi ? h("textarea", { rows: 8, placeholder: opts.placeholder || "" }) : h("input", { value, placeholder: opts.placeholder || "", style: { width: "100%" } });
+    if (opts.multi) inp.value = value;
+    let done = false; d.addEventListener("close", () => { if (!done) res(null); });
+    d.append(h("form", { onsubmit: e => { e.preventDefault(); done = true; d.close(); res(inp.value); } },
+      h("header", h("h2", title)), h("div.bd", h("label.fld", label, inp), opts.hint ? h("p.muted.small", opts.hint) : null),
+      h("footer", h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel"), h("button.btn.pri", opts.ok || "OK"))));
+    setTimeout(() => inp.focus(), 30);
+  }));
+}
+
+async function renderBids() {
+  const d = await api("/api/bids");
+  const rows = d.bids.map(b => { const t = b.totals || {}, j = b.job || {};
+    return h("tr.click", { onclick: () => location.hash = "#/bids/" + b.id },
+      h("td", h("b", j.no || "?"), h("div.muted.small", j.name || "(job not found)")),
+      h("td", b.name || "Bid", h("span.muted.small", "  rev " + b.rev), b.active ? h("span.pill.package", { style: { marginLeft: "6px" } }, "Active") : null),
+      h("td", h("span.pill.st-" + b.status, STATUS_LABEL[b.status] || b.status)),
+      h("td", DIV_LABEL[b.div] || b.div),
+      h("td.num", money(t.total)), h("td.num", hrs(t.laborSecs || 0)), h("td.num", t.lines || 0),
+      h("td.muted.small", (b.updated_at || "").slice(0, 10)));
+  });
+  const noRates = !(SET.costCodes || []).some(c => c.rates && (c.rates.EL || c.rates.LV));
+  show(h("div.row", h("h1.grow", "Bids"), h("button.btn.pri", { onclick: newBidDialog }, "+ New bid")),
+    noRates ? h("div.note.warn", "No labor rates are set yet, so labor totals $0. Set them in ", h("a", { href: "#/settings" }, "Settings"), ".") : null,
+    h("div.card", h("div.wrap", h("table",
+      h("thead", h("tr", h("th", "Job"), h("th", "Bid"), h("th", "Status"), h("th", "Division"), h("th.num", "Total"), h("th.num", "Labor"), h("th.num", "Lines"), h("th", "Updated"))),
+      h("tbody", rows.length ? rows : h("tr", h("td", { colspan: 8 }, h("span.muted", "No bids yet. Click + New bid to start one."))))))));
+}
+
+// a bid starts from a job: a new lead job (takes the next EL-/LV- lead number) or one that's already in SIS Tools
+function newBidDialog() {
+  dialog(d => {
+    let mode = "new";
+    const tabs = h("div.tabs"), pane = h("div"), foot = h("footer");
+    const start = async jobId => { const r = await api("/api/bids", { json: { job_id: jobId } }); d.close(); location.hash = "#/bids/" + r.id; };
+    const draw = () => {
+      fill(tabs, h("button.tab" + (mode === "new" ? ".on" : ""), { type: "button", onclick: () => { mode = "new"; draw(); } }, "New lead job"),
+        h("button.tab" + (mode === "job" ? ".on" : ""), { type: "button", onclick: () => { mode = "job"; draw(); } }, "Existing job"));
+      if (mode === "new") {
+        const f = { div: h("select", SET.divs.map(v => h("option", { value: v, disabled: SET.leads[v] == null }, DIV_LABEL[v] + (SET.leads[v] != null ? ` (gets ${leadText(v)})` : " (set its lead number in Settings)")))),
+          name: h("input", { required: true, placeholder: "Smith Residence" }), addr: h("input"), contact: h("input"), phone: h("input") };
+        const firstOk = SET.divs.find(v => SET.leads[v] != null); if (firstOk) f.div.value = firstOk;
+        fill(pane, h("p.muted.small", "This makes the job in SIS Tools with the next lead number for its division, then opens a new bid on it. Lead numbers are never reused."),
+          h("div.grid", field("Division *", f.div), field("Job name *", f.name), field("Address", f.addr, "span2"), field("Contact", f.contact), field("Phone", f.phone)));
+        fill(foot, h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel"), h("button.btn.pri", { type: "submit" }, "Create job and bid"));
+        d._go = async () => { if (!firstOk) return toast("Set the lead numbers in Settings first.", true);
+          const r = await api("/api/jobs", { json: Object.fromEntries(Object.entries(f).map(([k, el]) => [k, el.value])) });
+          SET = await api("/api/settings"); toast(`Job ${r.job.no} created`); await start(r.job.id); };
+        setTimeout(() => f.name.focus(), 30);
+      } else {
+        const q = h("input", { type: "search", placeholder: "Search job number, lead number, name or address…", style: { width: "100%" } }), list = h("div.joblist");
+        const load = async () => { const r = await api("/api/jobs?q=" + encodeURIComponent(q.value));
+          fill(list, ...(r.jobs.length ? r.jobs.map(j => h("div.jobrow", { onclick: () => start(j.id).catch(e => toast(e.message, true)) },
+            h("b", j.no || j.lead || "—"), h("span.grow", j.name, j.addr ? h("span.muted.small", "  " + j.addr) : null),
+            h("span.muted.small", j.div), j.bids ? h("span.pill", j.bids + (j.bids === 1 ? " bid" : " bids")) : null)) : [h("div.muted", "No jobs match.")])); };
+        let tm; q.addEventListener("input", () => { clearTimeout(tm); tm = setTimeout(load, 200); });
+        fill(pane, q, list); load(); setTimeout(() => q.focus(), 30);
+        fill(foot, h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel"));
+        d._go = null;
+      }
+    };
+    d.append(h("form", { onsubmit: async e => { e.preventDefault(); if (d._go) try { await d._go(); } catch (er) { toast(er.message, true); } } },
+      h("header", h("h2", "New bid")), h("div.bd", tabs, pane), foot));
+    draw();
+  });
+}
+
+const BV = { id: 0, room: "all", view: "lines", sel: new Set(), qty: 1, sys: "" };
+async function renderBid(id) {
+  if (BV.id !== id) Object.assign(BV, { id, room: "all", view: "lines", sel: new Set(), qty: 1, sys: "" });
+  let D = await api("/api/bids/" + id);
+  const others = (await api("/api/bids?job=" + encodeURIComponent(D.bid.job_id))).bids;
+  const job = D.job || { no: "?", name: "(job not found)" };
+  const totalsBox = h("div.card.totals"), treeBox = h("div.card.tree"), mainBox = h("div.grow", { style: { minWidth: 0 } }), payBox = h("div");
+
+  const reload = async () => { D = await api("/api/bids/" + id); BV.sel = new Set([...BV.sel].filter(x => D.lines.some(l => l.id === x))); drawAll(); };
+  const run = async (fn, msg) => { try { const r = await fn(); if (msg) toast(typeof msg === "function" ? msg(r) : msg); await reload(); return r; } catch (e) { toast(e.message, true); } };
+  const putBid = b => run(() => api("/api/bids/" + id, { method: "PUT", json: b }));
+  const saveLine = (lid, b) => run(() => api("/api/lines/" + lid, { method: "PUT", json: b }));
+
+  // rooms
+  const kids = () => { const k = {}; for (const r of D.rooms) (k[r.parent_id || 0] ||= []).push(r); return k; };
+  const roomById = () => Object.fromEntries(D.rooms.map(r => [r.id, r]));
+  const roomPath = rid => { const m = roomById(); const out = []; let r = m[rid]; while (r) { out.unshift(r.name); r = m[r.parent_id]; } return out.join(" › ") || "Not in a room"; };
+  const depthOf = rid => { const m = roomById(); let n = 0, r = m[rid]; while (r && r.parent_id) { n++; r = m[r.parent_id]; } return n; };
+  const under = rid => { const k = kids(), out = new Set([rid]); const walk = x => (k[x] || []).forEach(c => { out.add(c.id); walk(c.id); }); walk(rid); return out; };
+  const roomSell = rid => [...under(rid)].reduce((a, x) => a + ((D.totals.byRoom[String(x)] || {}).sell || 0), 0);
+  const roomOptions = () => { const k = kids(), out = []; const walk = (pid, dep) => (k[pid] || []).forEach(r => { out.push(h("option", { value: r.id }, " ".repeat(dep) + r.name)); walk(r.id, dep + 1); }); walk(0, 0); return out; };
+
+  const drawTotals = () => {
+    const t = D.totals;
+    fill(totalsBox, h("div.stats",
+      h("div", h("b", money(t.equipSell)), "Equipment"), t.svcSell ? h("div", h("b", money(t.svcSell)), "Services") : null,
+      h("div", h("b", money(t.laborSell)), `Labor · ${hrs(t.laborSecs)}`), h("div", h("b", money(t.tax)), `Tax ${D.bid.tax_pct || 0}% on materials`),
+      h("div.big", h("b", money(t.total)), "Total"), h("div", h("b", money(t.cost)), "Equipment cost"), h("div", h("b", (t.margin || 0) + "%"), "Margin")),
+      t.missingRate.length ? h("div.note.warn", { style: { margin: "10px 0 0" } }, `No ${DIV_LABEL[D.bid.div]} rate for ${t.missingRate.map(codeName).join(", ")}, so that labor counts as $0. Set it in `, h("a", { href: "#/settings" }, "Settings"), ".") : null);
+    const steps = D.bid.pay_steps || [];
+    fill(payBox, h("div.small", steps.length ? steps.map((s, i) => h("div.paystep", h("span.grow", `${i + 1}. ${s.label}`), h("span.muted", s.pct + "%"), h("b.num", money(r2c(t.total * s.pct / 100))))) : h("span.muted", "No milestones.")));
+  };
+  const r2c = n => Math.round(n * 100) / 100;
+
+  const drawTree = () => {
+    const k = kids(), sel = BV.room;
+    const node = (label, key, amt, dep, extra) => h("div.tn" + (String(sel) === String(key) ? ".on" : ""), { style: { paddingLeft: 8 + dep * 16 + "px" }, onclick: () => { BV.room = key; BV.view = "lines"; drawAll(); } },
+      h("span.grow", label), extra || null, h("span.muted.small", money(amt)));
+    const rows = [node(h("b", "All rooms"), "all", D.totals.total - D.totals.tax, 0)];
+    const walk = (pid, dep) => (k[pid] || []).forEach(r => { rows.push(node(r.name, r.id, roomSell(r.id), dep)); walk(r.id, dep + 1); }); walk(0, 0);
+    if (D.lines.some(l => !l.room_id)) rows.push(node(h("i", "Not in a room"), "none", (D.totals.byRoom["0"] || {}).sell || 0, 0));
+    const rid = typeof sel === "number" ? sel : null;
+    const addRooms = async parent => {
+      const v = await ask(parent ? `Add inside ${roomPath(parent)}` : "Add rooms", "Names, one per line", "", { multi: true, ok: "Add", placeholder: "Level 1\nLevel 2\nGarage", hint: "Rooms go three levels deep, for example Level 1 › Kitchen › Pantry. Paste a list to add many at once." });
+      const names = (v || "").split(/\r?\n/).map(s => s.trim()).filter(Boolean); if (!names.length) return;
+      await run(() => api(`/api/bids/${id}/rooms`, { json: { parent_id: parent, names } }), names.length > 1 ? `${names.length} rooms added` : null);
+    };
+    fill(treeBox, h("header", h("h2", "Rooms")), h("div.bd", rows,
+      h("div.row", { style: { marginTop: "10px" } },
+        h("button.btn.sm", { onclick: () => addRooms(null) }, "+ Room"),
+        rid && depthOf(rid) < 2 ? h("button.btn.sm", { onclick: () => addRooms(rid) }, "+ Inside") : null,
+        rid ? h("button.btn.sm", { onclick: async () => { const v = await ask("Rename room", "Name", roomById()[rid].name, { ok: "Save" }); if (v && v.trim()) run(() => api("/api/rooms/" + rid, { method: "PUT", json: { name: v } })); } }, "Rename") : null,
+        rid ? h("button.btn.sm.danger", { onclick: () => { const n = under(rid).size - 1, l = D.lines.filter(x => under(rid).has(x.room_id)).length;
+          if (!confirm(`Delete ${roomPath(rid)}${n ? ` and its ${n} room${n > 1 ? "s" : ""} inside` : ""}${l ? `, with ${l} line${l > 1 ? "s" : ""}` : ""}?`)) return;
+          BV.room = "all"; run(() => api("/api/rooms/" + rid, { method: "DELETE" })); } }, "Delete") : null)));
+  };
+
+  // lines
+  const lineMoney = l => {
+    const secs = (l.labor || []).reduce((a, x) => a + x.seconds, 0) * l.qty;
+    const lab = l.kind === "labor" && l.unit_price != null ? l.qty * l.unit_price : (l.labor || []).reduce((a, x) => a + x.seconds / 3600 * rateOf(x.cost_code, D.bid.div), 0) * l.qty;
+    return { secs, lab, ext: l.kind === "labor" ? 0 : l.qty * (l.unit_price || 0) };
+  };
+  const visible = () => BV.room === "all" ? D.lines : BV.room === "none" ? D.lines.filter(l => !l.room_id) : D.lines.filter(l => under(BV.room).has(l.room_id));
+
+  const addBar = () => {
+    const q = h("input", { type: "search", placeholder: "Search the catalog to add an item…" }), drop = h("div.list", { hidden: true });
+    const qty = h("input", { type: "number", step: "any", min: "0", value: BV.qty, style: { width: "80px" }, title: "Quantity", onchange: e => BV.qty = parseFloat(e.target.value) || 1 });
+    const sys = h("input", { list: "bidsys", value: BV.sys, placeholder: "System (or the item's own)", style: { width: "210px" }, onchange: e => BV.sys = e.target.value });
+    const add = async it => { q.value = ""; drop.hidden = true;
+      const room = typeof BV.room === "number" ? BV.room : null;
+      await run(() => api(`/api/bids/${id}/lines`, { json: { items: [{ item_id: it.id, qty: BV.qty, room_id: room, system: BV.sys }] } }), `Added ${[it.manufacturer, it.model].filter(Boolean).join(" ")}`); };
+    let tm, hits = []; q.addEventListener("input", () => { clearTimeout(tm); tm = setTimeout(async () => {
+      if (!q.value.trim()) { drop.hidden = true; return; }
+      hits = (await api(`/api/catalog?q=${encodeURIComponent(q.value)}&limit=15`)).items;
+      fill(drop, ...(hits.length ? hits.map(it => h("div", { onmousedown: e => { e.preventDefault(); add(it); } },
+        h("span.pill." + it.kind, KIND_LABEL[it.kind]), " ", h("b", [it.manufacturer, it.model].filter(Boolean).join(" ")), it.short_desc ? h("span.muted.small", "  " + it.short_desc.slice(0, 80)) : null)) : [h("div.muted", "No matches")]));
+      drop.hidden = false; }, 200); });
+    q.addEventListener("keydown", e => { if (e.key === "Enter" && hits.length && !drop.hidden) { e.preventDefault(); add(hits[0]); } });
+    q.addEventListener("blur", () => setTimeout(() => drop.hidden = true, 150));
+    const where = typeof BV.room === "number" ? roomPath(BV.room) : null;
+    return h("div.card", h("div.bd",
+      h("div.row", h("div.picker.grow", { style: { minWidth: "240px" } }, q, drop), qty, sys,
+        h("datalist", { id: "bidsys" }, sysOptions(D.lines.map(l => l.system)).map(v => h("option", { value: v })))),
+      h("div.muted.small", { style: { marginTop: "6px" } }, where ? `Adds to ${where}.` : D.rooms.length ? "Pick a room on the left first, or the item goes in Not in a room." : "Add rooms on the left, then add items to them.")));
+  };
+
+  const bulkBar = () => {
+    if (!BV.sel.size) return null; const ids = [...BV.sel];
+    const mv = h("select", { onchange: e => { if (e.target.value) run(() => api(`/api/bids/${id}/lines/bulk`, { json: { ids, room_id: e.target.value === "none" ? null : +e.target.value } }), "Moved"); } },
+      h("option", { value: "" }, "Move to room…"), h("option", { value: "none" }, "Not in a room"), roomOptions());
+    const cp = h("select", { onchange: e => { if (e.target.value) run(() => api(`/api/bids/${id}/lines/bulk`, { json: { ids, copy_to_rooms: [e.target.value === "none" ? null : +e.target.value] } }), "Copied"); } },
+      h("option", { value: "" }, "Copy to room…"), roomOptions());
+    return h("div.note.bulk", h("div.row", h("b", `${ids.length} selected`), mv, cp,
+      h("button.btn.sm", { onclick: async () => { const v = await ask("Set system", "System", "", { ok: "Set" }); if (v != null) run(() => api(`/api/bids/${id}/lines/bulk`, { json: { ids, system: v } }), "System set"); } }, "Set system"),
+      h("button.btn.sm.danger", { onclick: () => { if (confirm(`Delete ${ids.length} line${ids.length > 1 ? "s" : ""}?`)) { BV.sel.clear(); run(() => api(`/api/bids/${id}/lines/bulk`, { json: { ids, delete: true } }), "Deleted"); } } }, "Delete"),
+      h("button.btn.sm", { onclick: () => { BV.sel.clear(); drawMain(); } }, "Clear")));
+  };
+
+  const linesTable = () => {
+    const ls = visible(), showRoom = BV.room === "all" || (typeof BV.room === "number" && under(BV.room).size > 1);
+    const groups = {}; for (const l of ls) (groups[l.system || ""] ||= []).push(l);
+    const cols = showRoom ? 11 : 10, body = [];
+    const allBox = h("input", { type: "checkbox", title: "Select all", checked: ls.length && ls.every(l => BV.sel.has(l.id)), onchange: e => { ls.forEach(l => e.target.checked ? BV.sel.add(l.id) : BV.sel.delete(l.id)); drawMain(); } });
+    for (const g of Object.keys(groups).sort((a, b) => (a === "") - (b === "") || a.localeCompare(b))) {
+      const gl = groups[g], gt = gl.reduce((a, l) => { const m = lineMoney(l); a.ext += m.ext; a.lab += m.lab; a.secs += m.secs; return a; }, { ext: 0, lab: 0, secs: 0 });
+      body.push(h("tr.grp", h("td", { colspan: cols - 4 }, g || "No system"), h("td.num", money(gt.ext)), h("td.num.small", fmtHms(gt.secs)), h("td.num", money(gt.lab)), h("td")));
+      for (const l of gl) {
+        const m = lineMoney(l);
+        const price = l.kind === "labor" && l.unit_price == null ? h("span.muted.small", "at rate")
+          : h("input.price", { type: "number", step: "0.01", min: "0", value: (+(l.unit_price || 0)).toFixed(2), onchange: e => saveLine(l.id, { unit_price: e.target.value }) });
+        body.push(h("tr",
+          h("td", h("input", { type: "checkbox", checked: BV.sel.has(l.id), onchange: e => { e.target.checked ? BV.sel.add(l.id) : BV.sel.delete(l.id); drawMain(); } })),
+          h("td", h("input.qty", { type: "number", step: "any", min: "0", value: l.qty, onchange: e => saveLine(l.id, { qty: e.target.value }) })),
+          h("td", h("span.pill." + l.kind, KIND_LABEL[l.kind]), " ", h("b", [l.manufacturer, l.model].filter(Boolean).join(" ")),
+            l.description ? h("div.desc", l.description) : null,
+            l.contents.length ? h("details.small", h("summary.muted", `${l.contents.length} part${l.contents.length > 1 ? "s" : ""}`), l.contents.map(c => h("div", `${c.qty} × ${[c.manufacturer, c.model].filter(Boolean).join(" ")}`))) : null),
+          showRoom ? h("td.small", roomPath(l.room_id)) : null,
+          h("td.small", h("input.sysin", { list: "bidsys", value: l.system || "", placeholder: "—", onchange: e => saveLine(l.id, { system: e.target.value }) })),
+          h("td.num", money(l.unit_cost)), h("td.num", price), h("td.num", money(m.ext)),
+          h("td.num.small", fmtHms(m.secs), l.labor.length ? h("div.muted", l.labor.map(x => x.cost_code).join(", ")) : null), h("td.num", money(m.lab)),
+          h("td", h("button.btn.sm.danger", { title: "Remove this line", onclick: () => run(() => api("/api/lines/" + l.id, { method: "DELETE" })) }, "×"))));
+      }
+    }
+    return h("div.card", h("div.wrap", h("table.lines",
+      h("thead", h("tr", h("th", allBox), h("th", "Qty"), h("th", "Item"), showRoom ? h("th", "Room") : null, h("th", "System"), h("th.num", "Unit cost"), h("th.num", "Unit sell"),
+        h("th.num", "Ext sell"), h("th.num", "Labor"), h("th.num", "Labor $"), h("th"))),
+      h("tbody", body.length ? body : h("tr", h("td", { colspan: cols }, h("span.muted", "No items here yet. Search the catalog above to add some.")))))));
+  };
+
+  const summary = () => {
+    const t = D.totals;
+    if (BV.view === "system") {
+      const rows = Object.entries(t.bySystem).sort((a, b) => b[1].sell - a[1].sell);
+      return h("div.card", h("div.wrap", h("table", h("thead", h("tr", h("th", "System"), h("th.num", "Sell incl. labor"), h("th.num", "Labor"), h("th.num", "Labor hours"), h("th.num", "Equipment cost"))),
+        h("tbody", rows.map(([k, v]) => h("tr", h("td", k || h("i.muted", "No system")), h("td.num", money(v.sell)), h("td.num", money(v.labor)), h("td.num", hrs(v.secs)), h("td.num", money(v.cost))))))));
+    }
+    if (BV.view === "code") {
+      const rows = Object.entries(t.byCode).sort((a, b) => a[0].localeCompare(b[0]));
+      return h("div.card", h("div.wrap", h("table", h("thead", h("tr", h("th", "Cost code"), h("th.num", "Hours"), h("th.num", "H:M:S"), h("th.num", `${DIV_LABEL[D.bid.div]} rate`), h("th.num", "Labor $"))),
+        h("tbody", rows.map(([c, v]) => h("tr", h("td", codeName(c) || h("i.muted", "No code")), h("td.num", (v.secs / 3600).toFixed(2)), h("td.num", fmtHms(v.secs)), h("td.num", money(rateOf(c, D.bid.div))), h("td.num", money(v.labor)))),
+          h("tr.grp", h("td", "Total"), h("td.num", (t.laborSecs / 3600).toFixed(2)), h("td.num", fmtHms(t.laborSecs)), h("td"), h("td.num", money(t.laborSell)))))));
+    }
+    const k = kids(), rows = []; const walk = (pid, dep) => (k[pid] || []).forEach(r => { const own = t.byRoom[String(r.id)] || {};
+      rows.push(h("tr", h("td", { style: { paddingLeft: 9 + dep * 18 + "px" } }, r.name), h("td.num", money(roomSell(r.id))), h("td.num", money(own.sell || 0)), h("td.num", hrs([...under(r.id)].reduce((a, x) => a + ((t.byRoom[String(x)] || {}).secs || 0), 0))))); walk(r.id, dep + 1); });
+    walk(0, 0); if (t.byRoom["0"]) rows.push(h("tr", h("td", h("i", "Not in a room")), h("td.num", money(t.byRoom["0"].sell)), h("td.num", money(t.byRoom["0"].sell)), h("td.num", hrs(t.byRoom["0"].secs))));
+    return h("div.card", h("div.wrap", h("table", h("thead", h("tr", h("th", "Room"), h("th.num", "Sell incl. rooms inside"), h("th.num", "This room only"), h("th.num", "Labor hours"))), h("tbody", rows))));
+  };
+
+  const drawMain = () => {
+    const vt = (k, label) => h("button.tab" + (BV.view === k ? ".on" : ""), { onclick: () => { BV.view = k; drawMain(); } }, label);
+    fill(mainBox, h("div.tabs", vt("lines", "Items"), vt("room", "By room"), vt("system", "By system"), vt("code", "By cost code")),
+      BV.view === "lines" ? [addBar(), bulkBar(), linesTable()] : summary());
+  };
+  const drawAll = () => { drawTotals(); drawTree(); drawMain(); };
+
+  // the bid's own settings
+  const nm = h("input", { value: D.bid.name, onchange: e => putBid({ name: e.target.value }) });
+  const rev = h("select", { onchange: e => location.hash = "#/bids/" + e.target.value }, others.map(b => h("option", { value: b.id, selected: b.id === id }, `Rev ${b.rev} · ${b.name || "Bid"}${b.active ? " (active)" : ""}`)));
+  const st = h("select", { onchange: e => putBid({ status: e.target.value }) }, Object.entries(STATUS_LABEL).map(([k, v]) => h("option", { value: k, selected: D.bid.status === k }, v)));
+  const dv = h("select", { onchange: e => putBid({ div: e.target.value }) }, SET.divs.map(v => h("option", { value: v, selected: D.bid.div === v }, DIV_LABEL[v])));
+  const tax = h("input", { type: "number", step: "0.001", min: "0", max: "30", value: D.bid.tax_pct || 0, onchange: e => putBid({ tax_pct: e.target.value }) });
+  const mg = h("input", { type: "number", step: "0.1", min: "0", max: "95", value: D.bid.margin_pct ?? "", placeholder: "Catalog prices", onchange: e => putBid({ margin_pct: e.target.value }) });
+  const pay = h("select", { onchange: e => putBid({ pay_id: e.target.value }) }, (SET.paySchedules || []).map(p => h("option", { value: p.id, selected: D.bid.pay_id === p.id }, p.name)));
+  const editSteps = () => dialog(d => {
+    const steps = (D.bid.pay_steps || []).map(s => ({ ...s })), box = h("div");
+    const draw = () => fill(box, ...steps.map((s, i) => h("div.lab-row", h("input", { value: s.label, style: { flex: 1 }, onchange: e => s.label = e.target.value }),
+      h("input", { type: "number", step: "any", value: s.pct, style: { width: "90px" }, onchange: e => s.pct = parseFloat(e.target.value) || 0 }), "%",
+      h("button.btn.sm.danger", { type: "button", onclick: () => { steps.splice(i, 1); draw(); } }, "Remove"))), h("button.btn.sm", { type: "button", onclick: () => { steps.push({ label: "", pct: 0 }); draw(); } }, "+ Milestone"));
+    draw();
+    d.append(h("form", { onsubmit: async e => { e.preventDefault(); try { await api("/api/bids/" + id, { method: "PUT", json: { pay_steps: steps } }); d.close(); await reload(); } catch (er) { toast(er.message, true); } } },
+      h("header", h("h2", "Payment milestones for this bid")), h("div.bd", h("p.muted.small", "Changes here apply to this bid only. Milestones must total 100%."), box),
+      h("footer", h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel"), h("button.btn.pri", "Save"))));
+  });
+
+  show(
+    h("div.row", h("a.btn.sm", { href: "#/bids" }, "← Bids"), h("h1.grow", { style: { margin: "4px 0" } }, `${job.no} · ${job.name}`),
+      D.bid.active ? h("span.pill.package", "Active bid") : h("button.btn.sm", { onclick: () => putBid({ active: true }) }, "Make this the active bid"),
+      h("button.btn.sm", { onclick: () => run(() => api("/api/bids", { json: { job_id: D.bid.job_id, copy_from: id, name: D.bid.name } }), "New revision made").then(r => { if (r) location.hash = "#/bids/" + r.id; }) }, "New revision"),
+      h("button.btn.sm.danger", { onclick: async () => { if (!confirm(`Delete rev ${D.bid.rev} (${D.bid.name}) and everything in it?`)) return; try { await api("/api/bids/" + id, { method: "DELETE" }); location.hash = "#/bids"; } catch (e) { toast(e.message, true); } } }, "Delete bid")),
+    job.addr || job.contact ? h("div.muted.small", { style: { margin: "0 0 10px" } }, [job.addr, job.contact].filter(Boolean).join(" · ")) : null,
+    h("div.bidtop",
+      h("div.card", h("div.bd", h("div.grid.bidset", field("Bid name", nm), field("Revision", rev), field("Status", st), field("Division (sets labor rates)", dv),
+        field("Tax % on materials", tax), field("Margin % for unpriced items", mg)),
+        h("div.row", { style: { marginTop: "12px" } },
+          h("button.btn.sm", { title: "Pull current catalog cost, sell and labor into every line", onclick: () => { if (confirm("Pull current catalog prices and labor into every line that came from the catalog? Prices you typed in are replaced.")) run(() => api(`/api/bids/${id}/refresh`, { json: {} }), r => `${r.updated} lines updated`); } }, "Update prices from catalog"),
+          h("button.btn.sm", { disabled: D.bid.margin_pct == null, title: "Set every product and package to cost at this margin", onclick: () => { if (confirm(`Price every product and package at ${D.bid.margin_pct}% margin on cost?`)) run(() => api(`/api/bids/${id}/refresh`, { json: { at_margin: true } }), r => `${r.updated} lines repriced`); } }, "Apply margin to every line")))),
+      h("div.card", h("header", h("h2", "Payment schedule"), h("button.btn.sm", { onclick: editSteps }, "Edit for this bid")), h("div.bd", pay, payBox))),
+    totalsBox,
+    h("div.bidgrid", treeBox, mainBox));
+  drawAll();
 }
 
 // ---------------------------------------------------------------- catalog
