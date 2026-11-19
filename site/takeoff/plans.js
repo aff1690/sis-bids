@@ -1253,6 +1253,7 @@ function buildInspector(sheet, devices, data, types, typeMap, roomsById, ctx) {
   out.push(h("div.section",
     h("h3", "Claude analysis"),
     !ctx.meta.has_api_key ? h("div.warn", "Add your Anthropic API key to the server's .env file to enable plan analysis.") : null,
+    lookForEditor(data, ctx),
     h("div.row",
       h("button.primary", { disabled: !!ui.busy || !ctx.meta.has_api_key, onclick: () => runAnalysis(sheet, data, ctx) },
         a ? "Re-analyze sheet" : "Analyze with Claude"),
@@ -1310,6 +1311,55 @@ function buildInspector(sheet, devices, data, types, typeMap, roomsById, ctx) {
     compareWithSelect(sheet, data),
   ));
   return out;
+}
+
+// ======================================================================
+// "Look for" (Tony, 2026-11-19): the device types Claude counts on this job, each with the product or package it
+// becomes in the bid and an optional note on how its symbol is drawn. Empty = Claude counts everything it can read.
+function lookForEditor(data, ctx) {
+  const job = data.job, list = (job.settings?.lookfor || []).map((l) => ({ ...l }));
+  const typeLabel = Object.fromEntries(ctx.types.map((t) => [t.key, t.label]));
+  const save = async () => {
+    try {
+      const clean = list.map((l) => ({ type: l.type, label: typeLabel[l.type] || l.type, item_id: l.item_id || null, note: (l.note || "").slice(0, 300) }));
+      await api(`/api/jobs/${job.id}`, { method: "PATCH", json: { settings: { lookfor: clean } } });
+      job.settings = { ...(job.settings || {}), lookfor: clean }; ctx.rerender();
+    } catch (e) { toast(e.message, true); }
+  };
+  const missing = list.map((l) => l.item_id).filter((id) => id && !CAT.cache.has(id));
+  if (missing.length) Promise.all(missing.map(itemInfo)).then(() => ctx.rerender());
+  const used = new Set(list.map((l) => l.type));
+  const rows = list.map((l, i) => {
+    const it = l.item_id ? CAT.cache.get(l.item_id) : null, open = ui.lookPick === i;
+    let picker = null;
+    if (open) {
+      const q = h("input", { type: "search", placeholder: "Search products and packages…", style: { width: "100%" } }), drop = h("div.catlist");
+      const fillDrop = (items) => drop.replaceChildren(...(items.length ? items.map((x) => h("div.catrow", { onclick: () => { CAT.cache.set(x.id, x); l.item_id = x.id; ui.lookPick = null; save(); } },
+        x.fav ? h("span.star.on", "★") : null, h("span.kpill." + x.kind, KIND_LABEL[x.kind] || x.kind), h("span.grow", h("b", itemName(x))))) : [h("p.muted", "Nothing matches.")]));
+      fillDrop(CAT.favs || []);
+      let t; q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(async () => {
+        if (!q.value.trim()) return fillDrop(CAT.favs || []);
+        const r = await bidApi(`/api/catalog?q=${encodeURIComponent(q.value)}&limit=20`).catch(() => ({ items: [] })); fillDrop(r.items); }, 250); });
+      setTimeout(() => q.focus(), 0);
+      picker = h("div.attachpick", q, drop);
+    }
+    return h("div.lookrow",
+      h("div.row", { style: { gap: "4px" } },
+        h("select", { style: { flex: 1, fontSize: ".8rem" }, onchange: (e) => { l.type = e.target.value; save(); } },
+          h("option", { value: "" }, "Device type…"), ctx.types.map((t) => h("option", { value: t.key, selected: t.key === l.type, disabled: used.has(t.key) && t.key !== l.type }, t.label))),
+        h("button.small.danger", { title: "Remove", onclick: () => { list.splice(i, 1); save(); } }, "✕")),
+      h("div.attachrow" + (open ? ".open" : ""), { style: { marginTop: "3px" }, onclick: () => { ui.lookPick = open ? null : i; ctx.rerender(); } },
+        h("span.grow", it ? [h("span.kpill." + it.kind, KIND_LABEL[it.kind] || it.kind), " ", itemName(it)] : h("span.muted", "Counts as… (pick a product or package, or leave for the Settings default)"))),
+      picker,
+      h("input", { value: l.note || "", placeholder: "How the symbol looks (optional), e.g. circle with H", style: { width: "100%", fontSize: ".8rem", marginTop: "3px" }, onchange: (e) => { l.note = e.target.value; save(); } }));
+  });
+  return h("div.lookfor",
+    h("h4", { style: { margin: "4px 0" } }, `Look for${list.length ? ` (${list.length})` : ""}`),
+    h("p.muted", { style: { fontSize: ".72rem", margin: "0 0 4px" } }, list.length
+      ? "Claude counts only these on every sheet of this job, and each one comes into the bid as the item you picked."
+      : "Empty: Claude counts every device it can read. Add device types to count only those and pick the product or package each one becomes."),
+    ...rows,
+    h("button.small", { style: { margin: "4px 0 8px" }, onclick: () => { list.push({ type: "", item_id: null, note: "" }); save(); } }, "+ Add device type"));
 }
 
 // ======================================================================

@@ -258,7 +258,11 @@ on("POST", "/sheets/:id/analyze", async ({ req, params, ctx }) => {
   if (!overview?.png || !Array.isArray(tiles) || !tiles.length) fail(400, "Missing sheet images");
   const job = await getJob(sheet.job_id);
   return claudeJob(ctx, job.id, "analyze", async () => {
-    const result = await analyzeSheet({ sheet, overview, tiles, textItems: textItems || [], specText: specPrompt(jobSettings(job)) });
+    // The job's "Look for" list (Tony, 2026-11-19): only these device types are counted, each tagged with its catalog item.
+    const lookfor = (jobSettings(job).lookfor || []).filter((l) => TYPE_KEYS.includes(l.type));
+    const result = await analyzeSheet({ sheet, overview, tiles, textItems: textItems || [], specText: specPrompt(jobSettings(job)), lookfor });
+    const itemFor = new Map(lookfor.filter((l) => Number(l.item_id) > 0).map((l) => [l.type, Math.floor(Number(l.item_id))]));
+    if (lookfor.length) { const keep = new Set(lookfor.map((l) => l.type)); result.devices = result.devices.filter((d) => keep.has(d.type)); }
     const level = result.level_name || sheet.level;
 
     // Replace previous AI results on this sheet; keep anything entered by hand.
@@ -275,13 +279,13 @@ on("POST", "/sheets/:id/analyze", async ({ req, params, ctx }) => {
       if (r.number) roomIdByNumber.set(norm(r.number), id);
       if (r.name) roomIdByName.set(norm(r.name), id); // names are unique on a sheet even without a number
     }
-    const insDev = db.prepare(`INSERT INTO devices (job_id, sheet_id, room_id, type, x, y, source, status, confidence, note)
-      VALUES (?, ?, ?, ?, ?, ?, 'ai', 'pending', ?, ?)`);
+    const insDev = db.prepare(`INSERT INTO devices (job_id, sheet_id, room_id, type, x, y, source, status, confidence, note, item_id)
+      VALUES (?, ?, ?, ?, ?, ?, 'ai', 'pending', ?, ?, ?)`);
     const writes = [];
     for (const d of result.devices) {
       // Number first, then the unique room name; the nearest label is only a last resort.
       const roomId = roomIdByNumber.get(norm(d.room_number)) ?? roomIdByName.get(norm(d.room_name)) ?? await nearestRoomId(sheet.id, d.x, d.y);
-      writes.push(insDev.bind(sheet.job_id, sheet.id, roomId, d.type, d.x, d.y, d.confidence, d.note || ""));
+      writes.push(insDev.bind(sheet.job_id, sheet.id, roomId, d.type, d.x, d.y, d.confidence, d.note || "", itemFor.get(d.type) ?? null));
     }
     // Panels Claude found on the plan become suggested equipment markers (hand-placed ones win).
     const kindMap = { elec_panel: "elec_panel", subpanel: "elec_panel", lighting_panel: "dpm_panel" };

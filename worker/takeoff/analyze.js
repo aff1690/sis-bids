@@ -166,7 +166,7 @@ ${DEVICE_GUIDE}`;
 
 const withSpecs = (specText) => specText ? `${SYSTEM}\n\nThis job's specifications (they decide how the drawing is interpreted):\n${specText}` : SYSTEM;
 
-async function overviewPass({ sheet, overview, textItems, specText }) {
+async function overviewPass({ sheet, overview, textItems, specText, lookText = "" }) {
   const textList = textItems.map((t) => `${t.i}: "${t.s}" @ (${Math.round(t.x)}, ${Math.round(t.y)})`).join("\n");
   const content = [
     img(overview.png),
@@ -183,13 +183,13 @@ Tasks:
 3. List every room (use the room name and room number tags). For each room give the indexes of the text items that form its label inside the floor plan (not the legend, schedules or title block).
 4. Note anything an electrical estimator must know (ceiling outlets, TBD locations, special circuits, owner-furnished fixtures).
 5. List electrical equipment shown on the plan (panels, sub-panels, meters, generators, transfer switches) with the text items that label it.
-6. If any note or label indicates a generator, standby power or a transfer switch, quote it in generator_evidence.`,
+6. If any note or label indicates a generator, standby power or a transfer switch, quote it in generator_evidence.${lookText ? `\n\n${lookText}\nUse the symbol descriptions above when mapping the legend.` : ""}`,
     },
   ];
   return callClaude({ system: withSpecs(specText), content, schema: OVERVIEW_SCHEMA, effort: "high" });
 }
 
-async function tilePass({ tile, legend, roomsInTile, levelName, idx, total, specText }) {
+async function tilePass({ tile, legend, roomsInTile, levelName, idx, total, specText, lookText = "" }) {
   const legendText = legend.length
     ? legend.map((l) => `- ${l.symbol} => ${l.meaning} [${l.device_type}]`).join("\n")
     : "(no legend found - use standard residential electrical symbols)";
@@ -213,7 +213,7 @@ Find every electrical device symbol drawn on the floor plan in this tile: recept
 - Give the pixel position of each symbol's centre in this image.
 - Give the room the device is physically inside (by the walls, not the nearest label): its number, and always its name as labelled (room names are unique on a sheet even when a room has no number, e.g. 'SOUTH HALL'). Long halls contain every device along their length.
 - Put tags such as GFI, +39, USB, or the reason you are unsure in the note. Use lower confidence when unsure.
-- A switch drawn with a subscript (3, 4, D) is that switch type. Count each LED tape/under-cabinet run once.`,
+- A switch drawn with a subscript (3, 4, D) is that switch type. Count each LED tape/under-cabinet run once.${lookText ? `\n\n${lookText}` : ""}`,
     },
   ];
   return callClaude({ system: withSpecs(specText), content, schema: TILE_SCHEMA, effort: "high" });
@@ -490,11 +490,13 @@ async function mapLimit(items, limit, fn) {
  * @param tiles     [{png, w, h, x0, y0, x1, y1, cx0, cy0, cx1, cy1}] tile bounds and "core" bounds in PDF points
  * @param textItems [{i, s, x, y}] PDF text in points (top-left origin)
  */
-export async function analyzeSheet({ sheet, overview, tiles, textItems, specText = "" }) {
+export async function analyzeSheet({ sheet, overview, tiles, textItems, specText = "", lookfor = [] }) {
+  // The estimator's "Look for" list: only these device types, with what each symbol looks like on this job.
+  const lookText = lookfor.length ? `The estimator only wants these device types counted. Report nothing else:\n${lookfor.map((l) => `- ${l.type}${l.label ? ` (${l.label})` : ""}${l.note ? `: ${l.note}` : ""}`).join("\n")}` : "";
   const usage = { input: 0, output: 0 };
   const add = (u) => { usage.input += u.input; usage.output += u.output; };
 
-  const ov = await overviewPass({ sheet, overview, textItems, specText });
+  const ov = await overviewPass({ sheet, overview, textItems, specText, lookText });
   add(ov.usage);
   const byIndex = new Map(textItems.map((t) => [t.i, t]));
 
@@ -511,7 +513,7 @@ export async function analyzeSheet({ sheet, overview, tiles, textItems, specText
     const roomsInTile = rooms
       .filter((r) => r.x != null && r.x >= tile.x0 && r.x <= tile.x1 && r.y >= tile.y0 && r.y <= tile.y1)
       .map((r) => ({ ...r, px: (r.x - tile.x0) * sx, py: (r.y - tile.y0) * sy }));
-    const res = await tilePass({ tile, legend: ov.data.legend, roomsInTile, levelName: ov.data.level_name, idx, total: tiles.length, specText });
+    const res = await tilePass({ tile, legend: ov.data.legend, roomsInTile, levelName: ov.data.level_name, idx, total: tiles.length, specText, lookText });
     add(res.usage);
     // Convert to sheet points; keep only devices in this tile's core so overlaps are not double counted.
     return res.data.devices
