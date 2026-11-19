@@ -5,7 +5,7 @@
 import { db, DEFAULT_SETTINGS, jobSettings, getJob, ensureSchema } from "./db.js";
 import { DEVICE_TYPES, TYPE_KEYS } from "./deviceTypes.js";
 import { importDTools, searchCatalog, upsertItem } from "./catalog.js";
-import { analyzeSheet, autoZone, extractLoads, extractFixtures, codeCheck, assignRooms, hasApiKey } from "./analyze.js";
+import { analyzeSheet, readLegend, autoZone, extractLoads, extractFixtures, codeCheck, assignRooms, hasApiKey } from "./analyze.js";
 import { sizeLoad, dedupeLoads, reconcileLoads } from "./loads.js";
 import { buildEstimate, estimateCsv, loadAssemblies, jobAssemblies, resolveLines } from "./estimate.js";
 import { seedSpecs, loadSpecs, relinkSpecs, listSpecs, getSpec, specPrompt, sizeSystem, jobSpecs, pointsPerFoot, renumberZones,
@@ -259,10 +259,14 @@ on("POST", "/sheets/:id/analyze", async ({ req, params, ctx }) => {
   const job = await getJob(sheet.job_id);
   return claudeJob(ctx, job.id, "analyze", async () => {
     // The job's "Look for" list (Tony, 2026-11-19): only these device types are counted, each tagged with its catalog item.
-    const lookfor = (jobSettings(job).lookfor || []).filter((l) => TYPE_KEYS.includes(l.type));
+    // Legend lines (from "Read legend") match by key; older type-only lines match by device type.
+    const lookfor = (jobSettings(job).lookfor || []).filter((l) => TYPE_KEYS.includes(l.type) && l.count !== false).map((l, i) => ({ ...l, key: `L${i + 1}` }));
     const result = await analyzeSheet({ sheet, overview, tiles, textItems: textItems || [], specText: specPrompt(jobSettings(job)), lookfor });
-    const itemFor = new Map(lookfor.filter((l) => Number(l.item_id) > 0).map((l) => [l.type, Math.floor(Number(l.item_id))]));
-    if (lookfor.length) { const keep = new Set(lookfor.map((l) => l.type)); result.devices = result.devices.filter((d) => keep.has(d.type)); }
+    const byKey = new Map(lookfor.map((l) => [l.key, l]));
+    const byType = new Map(lookfor.map((l) => [l.type, l]));
+    if (lookfor.length) {
+      result.devices = result.devices.map((d) => { const l = byKey.get(String(d.legend_key || "").trim()) || byType.get(d.type); return l ? { ...d, type: l.type, item: Number(l.item_id) > 0 ? Math.floor(Number(l.item_id)) : null, note: [l.meaning, d.note].filter(Boolean).join(" · ") } : null; }).filter(Boolean);
+    }
     const level = result.level_name || sheet.level;
 
     // Replace previous AI results on this sheet; keep anything entered by hand.
@@ -285,7 +289,7 @@ on("POST", "/sheets/:id/analyze", async ({ req, params, ctx }) => {
     for (const d of result.devices) {
       // Number first, then the unique room name; the nearest label is only a last resort.
       const roomId = roomIdByNumber.get(norm(d.room_number)) ?? roomIdByName.get(norm(d.room_name)) ?? await nearestRoomId(sheet.id, d.x, d.y);
-      writes.push(insDev.bind(sheet.job_id, sheet.id, roomId, d.type, d.x, d.y, d.confidence, d.note || "", itemFor.get(d.type) ?? null));
+      writes.push(insDev.bind(sheet.job_id, sheet.id, roomId, d.type, d.x, d.y, d.confidence, d.note || "", d.item ?? null));
     }
     // Panels Claude found on the plan become suggested equipment markers (hand-placed ones win).
     const kindMap = { elec_panel: "elec_panel", subpanel: "elec_panel", lighting_panel: "dpm_panel" };
@@ -565,6 +569,15 @@ on("DELETE", "/zones/:id", async ({ params }) => {
 });
 
 // ---------------------------------------------------------------- room assignment (by walls, not nearest label)
+// Read the sheet's device legends for the "Look for" list (Tony, 2026-11-19)
+on("POST", "/sheets/:id/read-legend", async ({ req, params, ctx }) => {
+  const sheet = await db.prepare("SELECT * FROM sheets WHERE id = ?").get(params.id);
+  if (!sheet) notFound();
+  const { overview, textItems } = await readJson(req);
+  if (!overview?.png) fail(400, "Missing sheet image");
+  const job = await getJob(sheet.job_id);
+  return claudeJob(ctx, job.id, "read-legend", async () => readLegend({ sheet, overview, textItems: textItems || [], specText: specPrompt(jobSettings(job)) }));
+});
 on("POST", "/sheets/:id/assign-rooms", async ({ req, params, ctx }) => {
   const sheet = await db.prepare("SELECT * FROM sheets WHERE id = ?").get(params.id);
   if (!sheet) notFound();

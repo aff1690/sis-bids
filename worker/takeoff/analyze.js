@@ -132,11 +132,42 @@ const TILE_SCHEMA = {
           room_name: { type: "string", description: "Room name exactly as labelled on the drawing (e.g. 'SOUTH HALL'), even when it has no number" },
           confidence: { type: "number", description: "0-1" },
           note: { type: "string", description: "Mounting height, tag (GFI, +39), or why it is uncertain" },
+          legend_key: { type: "string", description: "Key of the matching line in the estimator's list (e.g. L3), or '' when there is no list" },
         },
       },
     },
   },
 };
+const LEGEND_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["entries"],
+  properties: {
+    entries: {
+      type: "array",
+      items: {
+        type: "object", additionalProperties: false, required: ["tag", "meaning", "symbol", "device_type"],
+        properties: {
+          tag: { type: "string", description: "Letter tag beside the symbol (e.g. 'R', 'OW'), or ''" },
+          meaning: { type: "string", description: "The legend's description, exactly as written (e.g. 'Recessed Downlight Adjustable')" },
+          symbol: { type: "string", description: "Short description of how the symbol is drawn, precise enough to tell it apart from the other symbols" },
+          device_type: { type: "string", enum: TYPE_KEYS },
+        },
+      },
+    },
+  },
+};
+
+/** Read the device legends on a sheet (lighting fixtures, power, controls) so the estimator can map each line to a catalog item. */
+export async function readLegend({ sheet, overview, textItems, specText = "" }) {
+  const textList = textItems.map((t) => `${t.i}: "${t.s}"`).join("\n");
+  const content = [img(overview.png), { type: "text", text: `This is sheet ${sheet.sheet_no || "?"} of a residential plan set. Text on the sheet:
+${textList}
+
+List every line of every device legend / symbol schedule on this sheet (lighting fixtures, receptacles, switches and controls, fans, low voltage, life safety).
+One entry per legend line, in the order shown. Two lines with the same device type but a different description (e.g. 'Recessed Downlight' and 'Recessed Downlight Adjustable') are separate entries.
+Describe each symbol precisely enough to tell it apart from the others. Skip general notes, abbreviations lists and title-block items.` }];
+  const res = await callClaude({ system: withSpecs(specText), content, schema: LEGEND_SCHEMA, effort: "medium" });
+  return { entries: res.data.entries, usage: { ...res.usage, cost_usd: +(res.usage.input * PRICE_IN + res.usage.output * PRICE_OUT).toFixed(2) } };
+}
 
 async function callClaude({ system, content, schema, effort }) {
   const msg = await streamMessage({
@@ -492,7 +523,8 @@ async function mapLimit(items, limit, fn) {
  */
 export async function analyzeSheet({ sheet, overview, tiles, textItems, specText = "", lookfor = [] }) {
   // The estimator's "Look for" list: only these device types, with what each symbol looks like on this job.
-  const lookText = lookfor.length ? `The estimator only wants these device types counted. Report nothing else:\n${lookfor.map((l) => `- ${l.type}${l.label ? ` (${l.label})` : ""}${l.note ? `: ${l.note}` : ""}`).join("\n")}` : "";
+  const lookText = lookfor.length ? `The estimator only wants these counted. Report nothing else, and give each device the key of the line it matches as legend_key:\n${lookfor.map((l) =>
+    `- ${l.key}: ${l.meaning ? `${l.tag ? `[${l.tag}] ` : ""}${l.meaning}` : l.label || l.type}${l.symbol ? `; drawn as ${l.symbol}` : ""}${l.note ? `; ${l.note}` : ""} (device type ${l.type})`).join("\n")}` : "";
   const usage = { input: 0, output: 0 };
   const add = (u) => { usage.input += u.input; usage.output += u.output; };
 
