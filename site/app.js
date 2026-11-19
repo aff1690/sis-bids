@@ -447,18 +447,39 @@ function packageEditor(items, onChange) {
         h("div.small.muted", { style: { alignSelf: "center" } }, Object.entries(lab).map(([c, s]) => `${fmtHms(s)} ${codeName(c)}`).join(" · ")));
     } catch (e) { sum.replaceChildren(h("span.muted", e.message)); }
   };
+  // a package inside the package expands to show its parts (Tony, 2026-11-19), read-only, nested packages too
+  const open = new Set(), kids = {};
+  const toggle = async path => {
+    if (open.has(path)) open.delete(path); else { open.add(path); const id = +path.split(/[/:]/).pop();
+      if (!kids[id]) { kids[id] = "loading"; draw(); try { kids[id] = (await api(`/api/catalog/${id}`)).item.items || []; } catch (e) { kids[id] = null; toast(e.message, true); } } }
+    draw();
+  };
+  const fmtQty = n => String(Math.round(n * 100) / 100);
+  const caret = path => h("span.caret", open.has(path) ? "▾" : "▸");
+  const subRows = (id, path, depth, mult) => {
+    if (!open.has(path)) return [];
+    const k = kids[id];
+    if (k === "loading" || !k) return [h("tr.sub", h("td"), h("td", { colSpan: 2, style: { paddingLeft: 12 + depth * 22 + "px" } }, h("span.muted.small", k ? "Loading…" : "Couldn't load.")))];
+    if (!k.length) return [h("tr.sub", h("td"), h("td", { colSpan: 2, style: { paddingLeft: 12 + depth * 22 + "px" } }, h("span.muted.small", "Empty package")))];
+    return k.flatMap(c => { const pth = path + "/" + c.item_id, pk = c.kind === "package";
+      return [h("tr.sub" + (pk ? ".pk" : ""), pk ? { onclick: () => toggle(pth) } : {},
+        h("td.small.muted", { style: { width: "110px", paddingLeft: "22px" } }, "× ", fmtQty(c.qty * mult)),
+        h("td", { colSpan: 2, style: { paddingLeft: 12 + depth * 22 + "px" } }, pk ? caret(pth) : null, h("span.pill." + (c.kind || "product"), KIND_LABEL[c.kind || "product"]), " ", [c.manufacturer, c.model].filter(Boolean).join(" "), c.part_number ? h("span.muted.small", "  #" + c.part_number) : null)),
+        ...(pk ? subRows(c.item_id, pth, depth + 1, c.qty * mult) : [])]; });
+  };
   const draw = () => {
     list.replaceChildren(h("table", h("thead", h("tr", h("th", "Qty"), h("th", "Part"), h("th"))),
-      h("tbody", items.map((x, i) => h("tr",
-        h("td", { style: { width: "110px" } }, h("input", { type: "number", step: "any", min: "0", value: x.qty, style: { width: "90px" }, onchange: e => { x.qty = Math.max(0, parseFloat(e.target.value) || 0); onChange && onChange(); recalc(); } })),
-        h("td", h("span.pill." + (x.kind || "product"), KIND_LABEL[x.kind || "product"]), " ", [x.manufacturer, x.model].filter(Boolean).join(" ")),
-        h("td.num", h("button.btn.sm.danger", { type: "button", onclick: () => { items.splice(i, 1); draw(); onChange && onChange(); recalc(); } }, "Remove")))))));
+      h("tbody", items.flatMap((x, i) => { const pk = x.kind === "package", path = i + ":" + x.item_id; return [h("tr",
+        h("td", { style: { width: "110px" } }, h("input", { type: "number", step: "any", min: "0", value: x.qty, style: { width: "90px" }, onchange: e => { x.qty = Math.max(0, parseFloat(e.target.value) || 0); onChange && onChange(); recalc(); draw(); } })),
+        h("td" + (pk ? ".pk" : ""), pk ? { onclick: () => toggle(path), title: open.has(path) ? "Hide what's inside" : "Show what's inside" } : {}, pk ? caret(path) : null, h("span.pill." + (x.kind || "product"), KIND_LABEL[x.kind || "product"]), " ", [x.manufacturer, x.model].filter(Boolean).join(" "), x.part_number ? h("span.muted.small", "  #" + x.part_number) : null),
+        h("td.num", h("button.btn.sm.danger", { type: "button", onclick: () => { items.splice(i, 1); open.clear(); draw(); onChange && onChange(); recalc(); } }, "Remove"))),
+        ...(pk ? subRows(x.item_id, path, 1, x.qty || 0) : [])]; }))));
   };
   const q = h("input", { type: "search", placeholder: "Search the catalog to add a part…", style: { width: "100%" } }), drop = h("div.list", { hidden: true });
   let tm; q.addEventListener("input", () => { clearTimeout(tm); tm = setTimeout(async () => {
     if (!q.value.trim()) { drop.hidden = true; return; }
     const r = await api(`/api/catalog?q=${encodeURIComponent(q.value)}&limit=15`);
-    drop.replaceChildren(...r.items.map(it => h("div", { onclick: () => { items.push({ item_id: it.id, qty: 1, kind: it.kind, manufacturer: it.manufacturer, model: it.model }); q.value = ""; drop.hidden = true; draw(); onChange && onChange(); recalc(); } },
+    drop.replaceChildren(...r.items.map(it => h("div", { onclick: () => { items.push({ item_id: it.id, qty: 1, kind: it.kind, manufacturer: it.manufacturer, model: it.model, part_number: it.part_number }); q.value = ""; drop.hidden = true; draw(); onChange && onChange(); recalc(); } },
       h("span.pill." + it.kind, KIND_LABEL[it.kind]), " ", h("b", [it.manufacturer, it.model].filter(Boolean).join(" ")), it.part_number ? h("span.muted", "  #" + it.part_number) : null)));
     if (!r.items.length) drop.replaceChildren(h("div.muted", "No matches")); drop.hidden = false; }, 200); });
   q.addEventListener("blur", () => setTimeout(() => drop.hidden = true, 200));
