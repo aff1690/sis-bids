@@ -379,6 +379,7 @@ async function renderCatalog() {
   let tm; search.addEventListener("input", () => { clearTimeout(tm); tm = setTimeout(() => { CAT.q = search.value; CAT.offset = 0; renderCatalog().then(() => { const s = app.querySelector("input[type=search]"); s.focus(); s.setSelectionRange(s.value.length, s.value.length); }); }, 250); });
   const tab = (k, label) => h("button.tab" + (CAT.kind === k ? ".on" : ""), { onclick: () => { CAT.kind = k; CAT.offset = 0; renderCatalog(); } }, label, h("span.n", k ? d.counts[k] || 0 : total));
   const file = h("input", { type: "file", accept: ".csv,text/csv", hidden: true, onchange: e => { const f = e.target.files[0]; e.target.value = ""; if (f) importDialog(f); } });
+  const pfile = h("input", { type: "file", accept: ".csv,text/csv", hidden: true, onchange: e => { const f = e.target.files[0]; e.target.value = ""; if (f) packageImportDialog(f); } });
   const catN = Object.fromEntries(d.cats.map(c => [c.category, c.n]));
   const catSel = h("select", { onchange: e => { CAT.cat = e.target.value === "__all__" ? null : e.target.value; CAT.offset = 0; renderCatalog(); } },
     h("option", { value: "__all__" }, "All categories"), d.cats.map(c => h("option", { value: c.category, selected: CAT.cat === c.category }, `${c.category || "No category"} (${c.n})`)));
@@ -405,6 +406,7 @@ async function renderCatalog() {
       h("button.btn", { onclick: () => editItem(0, "labor") }, "+ Labor item"),
       h("button.btn", { onclick: () => editItem(0, "service") }, "+ Service item"),
       h("button.btn", { onclick: () => editItem(0, "package") }, "+ Package"),
+      h("button.btn", { onclick: () => pfile.click(), title: "Build or update packages from a CSV: Package, Category, Subcategory, Description, Part Number, Manufacturer, Model, Qty" }, "Import packages"), pfile,
       h("button.btn.pri", { onclick: () => file.click() }, "Import D-Tools catalog"), file),
     !total ? h("div.note.warn", "The catalog is empty. Export your catalog from D-Tools SI (Product Explorer, export to CSV) and click Import D-Tools catalog. Old D-Tools labor codes are converted to your cost codes as they come in.") : null,
     h("div.tabs", tab("", "All"), tab("product", "Products"), tab("labor", "Labor items"), tab("service", "Service items"), tab("package", "Packages")),
@@ -518,6 +520,27 @@ async function editItem(id, kind) {
         sysList),
       h("footer", id ? h("button.btn.danger", { type: "button", onclick: del }, "Delete") : null, h("span.grow"),
         h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel"), h("button.btn.pri", "Save"))));
+  });
+}
+
+// packages from a CSV, one row per part (D-Tools can't export what's inside its packages)
+async function packageImportDialog(file) {
+  const rows = readCsv(await file.text());
+  const has = k => rows.length && Object.keys(rows[0]).some(x => x.trim().toLowerCase() === k);
+  if (!has("package")) return toast("That file needs a Package column, plus Part Number and Qty. Columns: Package, Category, Subcategory, Description, Part Number, Manufacturer, Model, Qty.", true);
+  let dry; try { dry = await api("/api/catalog/packages-import", { json: { rows, dry: true } }); } catch (e) { return toast(e.message, true); }
+  dialog(d => {
+    const go = async e => {
+      e.preventDefault(); e.submitter && (e.submitter.disabled = true);
+      try { const r = await api("/api/catalog/packages-import", { json: { rows } }); d.close(); toast(`Packages: ${r.added} new, ${r.updated} updated` + (r.missing.length ? `, ${r.missing.length} parts not found` : "") + "."); CAT.kind = "package"; CAT.offset = 0; renderCatalog(); }
+      catch (err) { toast(err.message, true); e.submitter && (e.submitter.disabled = false); }
+    };
+    d.append(h("form", { onsubmit: go }, h("header", h("h2", "Import packages")),
+      h("div.bd",
+        h("p", `${dry.packages} package${dry.packages === 1 ? "" : "s"} in ${file.name}: ${dry.added} new, ${dry.updated} already here (their contents will be replaced). ${dry.parts} part lines matched.`),
+        dry.missing.length ? h("div.note.warn", h("b", `${dry.missing.length} part${dry.missing.length === 1 ? "" : "s"} not found in the catalog. These lines will be left out:`), h("ul.small", dry.missing.slice(0, 40).map(x => h("li", x))), dry.missing.length > 40 ? h("p.small", `…and ${dry.missing.length - 40} more.`) : null) : null,
+        h("p.muted.small", "Parts are matched by part number. A row with no part number and a Model that names a package puts that package inside, so a shared kit (wire, staples, wire nuts) can live in one place.")),
+      h("footer", h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel"), h("button.btn.pri", "Import"))));
   });
 }
 

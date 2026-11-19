@@ -381,6 +381,15 @@ async function catalogApi(req, env, url, me) {
     const b = await req.json().catch(() => null), ids = (b && Array.isArray(b.ids) ? b.ids : []).slice(0, 200).map(x => Math.floor(numOr(x))).filter(x => x > 0);
     return json({ rollup: await rollup(env, ids) });
   }
+  // package import (Tony, 2026-11-19): D-Tools can't export package contents, so packages are rebuilt from a simple CSV,
+  // one row per part: Package, Category, Subcategory, Description, Part Number, Manufacturer, Model, Qty. A part is found by
+  // its part number (Manufacturer/Model break ties); a row with no part number and a Model that names a package nests that
+  // package. A package with the same name is updated: its contents are replaced by the file's.
+  if (p === "/api/catalog/packages-import" && req.method === "POST") {
+    const b = await req.json().catch(() => null); if (!b || !Array.isArray(b.rows)) return bad("Bad request");
+    if (b.rows.length > 3000) return bad("Send at most 3000 rows at a time.");
+    return json({ ok: true, ...(await importPackages(env, me, b.rows, !!b.dry)) });
+  }
   const m = p.match(/^\/api\/catalog\/(\d{1,12})$/);
   if (m) {
     const id = Number(m[1]);
@@ -394,6 +403,66 @@ async function catalogApi(req, env, url, me) {
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------- package import
+const pnKey = s => String(s || "").trim().replace(/^'+/, "").toLowerCase();
+async function importPackages(env, me, rows, dry) {
+  const g = (r, ...ks) => { for (const k of ks) { const hit = Object.keys(r).find(x => x.trim().toLowerCase() === k); if (hit && String(r[hit]).trim()) return String(r[hit]).trim(); } return ""; };
+  const pk = new Map();
+  for (const r of rows) {
+    const name = g(r, "package", "package name").slice(0, 160); if (!name) continue;
+    if (!pk.has(name)) pk.set(name, { name, category: "", subcategory: "", desc: "", lines: [] });
+    const P = pk.get(name);
+    P.category ||= g(r, "category").slice(0, 80); P.subcategory ||= g(r, "subcategory").slice(0, 80); P.desc ||= g(r, "description").slice(0, 1000);
+    const part = g(r, "part number", "part #", "part"), model = g(r, "model", "item"), mfr = g(r, "manufacturer", "mfr");
+    const qty = numOr(g(r, "qty", "quantity") || 1, 1);
+    if ((part || model) && qty > 0) P.lines.push({ part, model, mfr, qty: r4(qty) });
+  }
+  // every product, labor and service item with one of the part numbers, and every package named in the file
+  const parts = [...new Set([...pk.values()].flatMap(P => P.lines.map(l => pnKey(l.part)).filter(Boolean)))];
+  const byPart = new Map();
+  for (let i = 0; i < parts.length; i += 90) {
+    const s = parts.slice(i, i + 90);
+    const { results } = await env.DB.prepare(`SELECT id, manufacturer, model, part_number, discontinued FROM bid_catalog WHERE kind <> 'package' AND lower(replace(part_number, '''', '')) IN (${s.map(() => "?").join(",")}) ORDER BY discontinued, id`).bind(...s).all();
+    for (const x of results || []) { const k = pnKey(x.part_number); if (!byPart.has(k)) byPart.set(k, []); byPart.get(k).push(x); }
+  }
+  const names = [...new Set([...pk.keys(), ...[...pk.values()].flatMap(P => P.lines.filter(l => !l.part).map(l => l.model))])];
+  const pkgId = new Map();
+  for (let i = 0; i < names.length; i += 90) {
+    const s = names.slice(i, i + 90);
+    const { results } = await env.DB.prepare(`SELECT id, model FROM bid_catalog WHERE kind = 'package' AND model IN (${s.map(() => "?").join(",")})`).bind(...s).all();
+    for (const x of results || []) pkgId.set(x.model, x.id);
+  }
+  const low = s => String(s || "").toLowerCase();
+  const find = l => {
+    if (l.part) {
+      const c = byPart.get(pnKey(l.part)) || []; if (!c.length) return null;
+      return (l.model && c.find(x => low(x.model) === low(l.model))) || (l.mfr && c.find(x => low(x.manufacturer) === low(l.mfr))) || c[0];
+    }
+    if (pkgId.has(l.model)) return { id: pkgId.get(l.model), pkg: true };
+    if (pk.has(l.model)) return { id: -1, pkg: true };
+    return null;
+  };
+  const out = { packages: 0, added: 0, updated: 0, parts: 0, missing: [] };
+  for (const P of pk.values()) for (const l of P.lines) { const f = find(l); if (f) out.parts++; else out.missing.push(`${P.name}: ${l.part || l.model}`); }
+  out.packages = pk.size; out.added = [...pk.keys()].filter(n => !pkgId.has(n)).length; out.updated = pk.size - out.added;
+  out.missing = out.missing.slice(0, 200);
+  if (dry) return out;
+  // first make every package (empty), so packages can hold each other in any order, then fill them
+  for (const P of pk.values()) {
+    const body = { kind: "package", manufacturer: "", model: P.name, category: P.category, subcategory: P.subcategory, short_desc: P.desc };
+    const id = pkgId.get(P.name);
+    if (id) { const prev = await env.DB.prepare("SELECT category, subcategory, short_desc FROM bid_catalog WHERE id = ?").bind(id).first();
+      await env.DB.prepare("UPDATE bid_catalog SET category = ?, subcategory = ?, short_desc = ?, updated_at = ?, updated_by = ? WHERE id = ?")
+        .bind(P.category || prev.category, P.subcategory || prev.subcategory, P.desc || prev.short_desc, new Date().toISOString(), me.email, id).run(); }
+    else { const r = await saveItem(env, me, 0, { ...body, source: "pkg-import" }); const j = await r.json(); if (!j.item) throw new Error(j.error || "Couldn't add " + P.name); pkgId.set(P.name, j.item.id); }
+  }
+  for (const P of pk.values()) {
+    const items = P.lines.map(l => { const f = find(l); return f ? { item_id: f.pkg ? pkgId.get(l.model) : f.id, qty: l.qty } : null; }).filter(Boolean);
+    const r = await saveItem(env, me, pkgId.get(P.name), { kind: "package", items }); if (r.status >= 400) { const j = await r.json(); out.missing.push(`${P.name}: ${j.error}`); }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- the Worker
