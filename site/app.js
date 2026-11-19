@@ -371,13 +371,14 @@ async function renderBid(id) {
 }
 
 // ---------------------------------------------------------------- catalog
-const CAT = { q: "", kind: "", cat: null, offset: 0, limit: 100 };
+const CAT = { q: "", kind: "", fav: false, cat: null, offset: 0, limit: 100 };
 async function renderCatalog() {
-  const d = await api(`/api/catalog?q=${encodeURIComponent(CAT.q)}&kind=${CAT.kind}&limit=${CAT.limit}&offset=${CAT.offset}${CAT.cat != null ? "&cat=" + encodeURIComponent(CAT.cat) : ""}`);
-  const total = Object.values(d.counts).reduce((a, b) => a + b, 0);
+  const d = await api(`/api/catalog?q=${encodeURIComponent(CAT.q)}&kind=${CAT.kind}${CAT.fav ? "&fav=1" : ""}&limit=${CAT.limit}&offset=${CAT.offset}${CAT.cat != null ? "&cat=" + encodeURIComponent(CAT.cat) : ""}`);
+  const total = Object.entries(d.counts).reduce((a, [k, n]) => a + (k === "fav" ? 0 : n), 0);
   const search = h("input", { type: "search", placeholder: "Search manufacturer, model, part #, description, vendor…", value: CAT.q, style: { flex: "1", minWidth: "220px" } });
   let tm; search.addEventListener("input", () => { clearTimeout(tm); tm = setTimeout(() => { CAT.q = search.value; CAT.offset = 0; renderCatalog().then(() => { const s = app.querySelector("input[type=search]"); s.focus(); s.setSelectionRange(s.value.length, s.value.length); }); }, 250); });
-  const tab = (k, label) => h("button.tab" + (CAT.kind === k ? ".on" : ""), { onclick: () => { CAT.kind = k; CAT.offset = 0; renderCatalog(); } }, label, h("span.n", k ? d.counts[k] || 0 : total));
+  const tab = (k, label) => h("button.tab" + (!CAT.fav && CAT.kind === k ? ".on" : ""), { onclick: () => { CAT.kind = k; CAT.fav = false; CAT.offset = 0; renderCatalog(); } }, label, h("span.n", k ? d.counts[k] || 0 : total));
+  const favTab = h("button.tab.favtab" + (CAT.fav ? ".on" : ""), { onclick: () => { CAT.fav = true; CAT.kind = ""; CAT.offset = 0; renderCatalog(); } }, "★ Favorites", h("span.n", d.counts.fav || 0));
   const file = h("input", { type: "file", accept: ".csv,text/csv", hidden: true, onchange: e => { const f = e.target.files[0]; e.target.value = ""; if (f) importDialog(f); } });
   const pfile = h("input", { type: "file", accept: ".csv,text/csv", hidden: true, onchange: e => { const f = e.target.files[0]; e.target.value = ""; if (f) packageImportDialog(f); } });
   const catN = Object.fromEntries(d.cats.map(c => [c.category, c.n]));
@@ -385,12 +386,13 @@ async function renderCatalog() {
     h("option", { value: "__all__" }, "All categories"), d.cats.map(c => h("option", { value: c.category, selected: CAT.cat === c.category }, `${c.category || "No category"} (${c.n})`)));
   if (CAT.cat != null && !d.cats.some(c => c.category === CAT.cat)) catSel.append(h("option", { value: CAT.cat, selected: true }, CAT.cat || "No category"));
   let lastCat = null; const rows = [];
-  d.items.forEach(it => { const c = it.category || ""; if (c !== lastCat) { lastCat = c; rows.push(h("tr.grp", h("td", { colspan: 9 }, c || "No category", h("span.muted", { style: { fontWeight: 500, marginLeft: "8px" } }, `${catN[c] || 0} item${catN[c] === 1 ? "" : "s"}`)))); } rows.push(itemRow(it)); });
+  d.items.forEach(it => { const c = it.category || ""; if (c !== lastCat) { lastCat = c; rows.push(h("tr.grp", h("td", { colspan: 10 }, c || "No category", h("span.muted", { style: { fontWeight: 500, marginLeft: "8px" } }, `${catN[c] || 0} item${catN[c] === 1 ? "" : "s"}`)))); } rows.push(itemRow(it)); });
   function itemRow(it) {
     const price = it.kind === "package" ? it.rollup && it.rollup.price : it.unit_price;
     const cost = it.kind === "package" ? it.rollup && it.rollup.cost : it.unit_cost;
     const lab = it.kind === "package" ? Object.entries((it.rollup || {}).labor || {}).map(([c, s]) => ({ cost_code: c, seconds: s })) : it.labor;
     return h("tr.click", { onclick: () => editItem(it.id) },
+      h("td.favcell", favStar(it, () => CAT.fav && renderCatalog())),
       h("td", h("span.pill." + it.kind, KIND_LABEL[it.kind])),
       h("td", h("b", [it.manufacturer, it.model].filter(Boolean).join(" "))),
       h("td.small", it.part_number || h("span.muted", "—")),
@@ -409,14 +411,23 @@ async function renderCatalog() {
       h("button.btn", { onclick: () => pfile.click(), title: "Build or update packages from a CSV: Package, Category, Subcategory, Description, Part Number, Manufacturer, Model, Qty" }, "Import packages"), pfile,
       h("button.btn.pri", { onclick: () => file.click() }, "Import D-Tools catalog"), file),
     !total ? h("div.note.warn", "The catalog is empty. Export your catalog from D-Tools SI (Product Explorer, export to CSV) and click Import D-Tools catalog. Old D-Tools labor codes are converted to your cost codes as they come in.") : null,
-    h("div.tabs", tab("", "All"), tab("product", "Products"), tab("labor", "Labor items"), tab("service", "Service items"), tab("package", "Packages")),
+    h("div.tabs", favTab, tab("", "All"), tab("product", "Products"), tab("labor", "Labor items"), tab("service", "Service items"), tab("package", "Packages")),
     h("div.row", { style: { marginBottom: "10px" } }, search, catSel),
     h("div.card", h("div.wrap", { style: { maxHeight: "calc(100vh - 290px)" } }, h("table",
-      h("thead", h("tr", h("th", "Type"), h("th", "Item"), h("th", "Part #"), h("th", "Description"), h("th", "Subcategory"), h("th.num", "Cost"), h("th.num", "Sell"), h("th", "Labor (H:M:S)"), h("th", "Vendor"))),
-      h("tbody", rows.length ? rows : h("tr", h("td", { colspan: 9 }, h("span.muted", CAT.q ? "Nothing matches that search." : "Nothing here yet."))))))),
+      h("thead", h("tr", h("th", { title: "Favorites" }, "★"), h("th", "Type"), h("th", "Item"), h("th", "Part #"), h("th", "Description"), h("th", "Subcategory"), h("th.num", "Cost"), h("th.num", "Sell"), h("th", "Labor (H:M:S)"), h("th", "Vendor"))),
+      h("tbody", rows.length ? rows : h("tr", h("td", { colspan: 10 }, h("span.muted", CAT.q ? "Nothing matches that search." : CAT.fav ? "No favorites yet. Click the ☆ next to an item to add it." : "Nothing here yet."))))))),
     pages > 1 ? h("div.row", h("span.muted.small", `${d.total.toLocaleString()} items · page ${pg} of ${pages}`), h("span.grow"),
       h("button.btn.sm", { disabled: pg <= 1, onclick: () => { CAT.offset -= CAT.limit; renderCatalog(); } }, "Previous"),
       h("button.btn.sm", { disabled: pg >= pages, onclick: () => { CAT.offset += CAT.limit; renderCatalog(); } }, "Next")) : null);
+}
+
+// favorites star (shared by the whole team); clicking it doesn't open the row
+function favStar(it, after) {
+  const b = h("button.star" + (it.fav ? ".on" : ""), { type: "button", title: it.fav ? "Remove from favorites" : "Add to favorites", onclick: async e => {
+    e.stopPropagation(); const on = !it.fav;
+    try { await api(`/api/catalog/${it.id}/fav`, { method: "PUT", json: { on } }); it.fav = on; b.classList.toggle("on", on); b.textContent = on ? "★" : "☆"; b.title = on ? "Remove from favorites" : "Add to favorites"; after && after(); }
+    catch (err) { toast(err.message, true); } } }, it.fav ? "★" : "☆");
+  return b;
 }
 
 // labor lines editor: [{cost_code, seconds}]

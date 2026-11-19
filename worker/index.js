@@ -98,6 +98,8 @@ async function init(db) {
     db.prepare("CREATE TABLE IF NOT EXISTS bid_package_items (pkg_id INTEGER NOT NULL, n INTEGER NOT NULL, item_id INTEGER NOT NULL, qty REAL NOT NULL DEFAULT 1, PRIMARY KEY (pkg_id, n))"),
     db.prepare("CREATE INDEX IF NOT EXISTS bid_package_items_item ON bid_package_items (item_id)"),
     db.prepare("CREATE TABLE IF NOT EXISTS bid_lead_counters (div TEXT PRIMARY KEY, next INTEGER NOT NULL)"),
+    // favorites (Tony, 2026-11-19): shared by the whole team, starred in the catalog and the takeoff pop-out
+    db.prepare("CREATE TABLE IF NOT EXISTS bid_favorites (item_id INTEGER PRIMARY KEY, added_by TEXT DEFAULT '', added_at TEXT)"),
   ]);
   await initBids(db);
   ready = true;
@@ -298,6 +300,7 @@ async function saveItem(env, me, id, b) {
 async function getItem(env, id) {
   const r = await env.DB.prepare("SELECT * FROM bid_catalog WHERE id = ?").bind(id).first(); if (!r) return null;
   const o = outItem(r, await laborOf(env, [id]));
+  o.fav = !!(await env.DB.prepare("SELECT 1 AS x FROM bid_favorites WHERE item_id = ?").bind(id).first());
   if (r.kind === "package") {
     const { results } = await env.DB.prepare("SELECT p.item_id, p.qty, c.kind, c.manufacturer, c.model, c.part_number, c.unit_cost, c.unit_price FROM bid_package_items p LEFT JOIN bid_catalog c ON c.id = p.item_id WHERE p.pkg_id = ? ORDER BY p.n").bind(id).all();
     o.items = results || []; const ru = await rollup(env, [id, ...o.items.map(x => x.item_id)]); o.rollup = ru[id];
@@ -359,6 +362,7 @@ async function catalogApi(req, env, url, me) {
     const where = [], args = [];
     if (KINDS.includes(kind)) { where.push("kind = ?"); args.push(kind); }
     if (url.searchParams.get("all") !== "1") where.push("discontinued = 0");
+    if (url.searchParams.get("fav") === "1") where.push("id IN (SELECT item_id FROM bid_favorites)");
     for (const w of q.split(/\s+/).filter(Boolean).slice(0, 6)) { where.push("(manufacturer || ' ' || model || ' ' || part_number || ' ' || catalog_no || ' ' || category || ' ' || subcategory || ' ' || short_desc || ' ' || vendor) LIKE ?"); args.push("%" + w + "%"); }
     // grouped by category (Tony, 2026-11-19): items come sorted by category, packages first inside each; cats = count per category
     const W0 = where.length ? "WHERE " + where.join(" AND ") : "";
@@ -369,7 +373,9 @@ async function catalogApi(req, env, url, me) {
     const { results } = await env.DB.prepare(`SELECT * FROM bid_catalog ${W} ORDER BY category = '', category COLLATE NOCASE, kind = 'package' DESC, subcategory COLLATE NOCASE, manufacturer COLLATE NOCASE, model LIMIT ? OFFSET ?`).bind(...args, lim, off).all();
     const rows = results || [], labor = await laborOf(env, rows.map(r => r.id)), pk = rows.filter(r => r.kind === "package").map(r => r.id), ru = pk.length ? await rollup(env, pk) : {};
     const counts = Object.fromEntries(((await env.DB.prepare("SELECT kind, COUNT(*) AS n FROM bid_catalog WHERE discontinued = 0 GROUP BY kind").all()).results || []).map(r => [r.kind, r.n]));
-    return json({ total, counts, cats, items: rows.map(r => ({ ...outItem(r, labor), ...(ru[r.id] ? { rollup: ru[r.id] } : {}) })) });
+    counts.fav = (await env.DB.prepare("SELECT COUNT(*) AS n FROM bid_favorites f JOIN bid_catalog c ON c.id = f.item_id WHERE c.discontinued = 0").first()).n;
+    const favs = new Set(rows.length ? ((await env.DB.prepare(`SELECT item_id FROM bid_favorites WHERE item_id IN (${rows.map(() => "?").join(",")})`).bind(...rows.map(r => r.id)).all()).results || []).map(r => r.item_id) : []);
+    return json({ total, counts, cats, items: rows.map(r => ({ ...outItem(r, labor), fav: favs.has(r.id), ...(ru[r.id] ? { rollup: ru[r.id] } : {}) })) });
   }
   if (p === "/api/catalog" && req.method === "POST") { const b = await req.json().catch(() => null); if (!b) return bad("Bad request"); return saveItem(env, me, 0, b); }
   if (p === "/api/catalog/import" && req.method === "POST") {
@@ -389,6 +395,13 @@ async function catalogApi(req, env, url, me) {
     const b = await req.json().catch(() => null); if (!b || !Array.isArray(b.rows)) return bad("Bad request");
     if (b.rows.length > 3000) return bad("Send at most 3000 rows at a time.");
     return json({ ok: true, ...(await importPackages(env, me, b.rows, !!b.dry)) });
+  }
+  const fm = p.match(/^\/api\/catalog\/(\d{1,12})\/fav$/);
+  if (fm && req.method === "PUT") {
+    const b = await req.json().catch(() => ({})), id = Number(fm[1]);
+    if (b.on) await env.DB.prepare("INSERT OR IGNORE INTO bid_favorites (item_id, added_by, added_at) VALUES (?, ?, ?)").bind(id, me.email, new Date().toISOString()).run();
+    else await env.DB.prepare("DELETE FROM bid_favorites WHERE item_id = ?").bind(id).run();
+    return json({ ok: true, fav: !!b.on });
   }
   const m = p.match(/^\/api\/catalog\/(\d{1,12})$/);
   if (m) {

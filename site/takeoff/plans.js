@@ -92,7 +92,7 @@ function trackDevicePatches(ctx) {
 const devicePayload = (d) => ({ item_id: d.item_id ?? null, type: d.type, sheet_id: d.sheet_id, x: d.x, y: d.y, room_id: d.room_id, zone_id: d.zone_id, status: d.status, source: d.source, confidence: d.confidence, note: d.note });
 // ---- SIS Bids catalog on the plans (Tony, 2026-11-19): pick a product or package from the bid catalog and click (or drag it)
 // onto the drawing. The marker counts as that exact item in the bid; its device type still drives circuits, zoning and layers.
-const CAT = { q: "", kind: "", items: [], cats: [], open: new Set(), byCat: {}, cache: new Map(), typeFor: {}, loaded: false };
+const CAT = { q: "", kind: "", items: [], cats: [], favs: [], favOpen: true, open: new Set(), byCat: {}, cache: new Map(), typeFor: {}, loaded: false };
 const KIND_LABEL = { product: "Product", labor: "Labor", service: "Service", package: "Package" };
 const itemName = (it) => it ? [it.manufacturer, it.model].filter(Boolean).join(" ") : "";
 async function bidApi(path, opts = {}) { // the bid site's own API (not the takeoff's /api/takeoff/…)
@@ -103,9 +103,16 @@ async function bidApi(path, opts = {}) { // the bid site's own API (not the take
 async function catSearch() {
   const r = await bidApi(`/api/catalog?q=${encodeURIComponent(CAT.q)}&kind=${CAT.kind}&limit=${CAT.q.trim() ? 150 : 1}`);
   CAT.cats = r.cats || []; CAT.byCat = {}; CAT.items = CAT.q.trim() ? r.items : [];
+  await loadFavs();
   for (const it of CAT.items) { CAT.cache.set(it.id, it); (CAT.byCat[it.category || ""] ||= []).push(it); }
   CAT.loaded = true;
   await Promise.all([...CAT.open].filter((c) => !CAT.byCat[c] && CAT.cats.some((x) => x.category === c)).map(loadCat));
+}
+// favorites (Tony, 2026-11-19): shared with the bid site's catalog, shown first and open
+async function loadFavs() {
+  const r = await bidApi(`/api/catalog?q=${encodeURIComponent(CAT.q)}&kind=${CAT.kind}&fav=1&limit=300`);
+  for (const it of r.items) CAT.cache.set(it.id, it);
+  CAT.favs = r.items;
 }
 async function loadCat(c) {
   const r = await bidApi(`/api/catalog?kind=${CAT.kind}&cat=${encodeURIComponent(c)}&limit=300`);
@@ -144,13 +151,22 @@ function buildCatalogPanel(sheet, devices, types, ctx) {
     draggable: "true", title: "Click it, then click the plan to place it. Or drag it onto the plan.",
     ondragstart: (e) => { e.dataTransfer.setData("application/x-sis-item", String(it.id)); e.dataTransfer.effectAllowed = "copy"; },
     onclick: () => pick(it),
-  }, h("span.kpill." + it.kind, KIND_LABEL[it.kind] || it.kind), h("span.grow", h("b", itemName(it)), it.part_number ? h("span.muted", { style: { fontSize: ".75rem" } }, `  #${it.part_number}`) : null, it.short_desc ? h("div.muted", { style: { fontSize: ".75rem" } }, it.short_desc.slice(0, 80)) : null));
+  }, h("span.star" + (it.fav ? ".on" : ""), { title: it.fav ? "Remove from favorites" : "Add to favorites", onclick: async (e) => {
+      e.stopPropagation(); const on = !it.fav;
+      try { await bidApi(`/api/catalog/${it.id}/fav`, { method: "PUT", body: JSON.stringify({ on }) }); it.fav = on;
+        for (const list of [CAT.items, CAT.favs, ...Object.values(CAT.byCat)]) for (const x of list || []) if (x.id === it.id) x.fav = on;
+        await loadFavs(); draw(); } catch (err) { toast(err.message, true); }
+    } }, it.fav ? "★" : "☆"), h("span.kpill." + it.kind, KIND_LABEL[it.kind] || it.kind), h("span.grow", h("b", itemName(it)), it.part_number ? h("span.muted", { style: { fontSize: ".75rem" } }, `  #${it.part_number}`) : null, it.short_desc ? h("div.muted", { style: { fontSize: ".75rem" } }, it.short_desc.slice(0, 80)) : null));
   const searching = () => !!CAT.q.trim();
   const draw = () => {
     if (!CAT.loaded) return list.replaceChildren(h("p.muted", "Loading…"));
     const cats = searching() ? CAT.cats.filter((c) => CAT.byCat[c.category]) : CAT.cats;
-    if (!cats.length) return list.replaceChildren(h("p.muted", searching() ? "Nothing matches." : "The catalog is empty."));
-    list.replaceChildren(...cats.flatMap((c) => {
+    if (!cats.length && !CAT.favs.length) return list.replaceChildren(h("p.muted", searching() ? "Nothing matches." : "The catalog is empty."));
+    const favOpen = searching() || CAT.favOpen;
+    const favRows = CAT.favs.length || !searching() ? [h("div.cathead.fav" + (favOpen ? ".open" : ""), { onclick: () => { if (searching()) return; CAT.favOpen = !CAT.favOpen; draw(); } },
+        h("span.caret", favOpen ? "▾" : "▸"), h("span.grow", "★ Favorites"), h("span.muted", `${CAT.favs.length}`)),
+      ...(favOpen ? (CAT.favs.length ? CAT.favs.map(row) : [h("p.muted", { style: { fontSize: ".75rem", margin: "4px 6px" } }, "Click the ☆ on any item to add it here.")]) : [])] : [];
+    list.replaceChildren(...favRows, ...cats.flatMap((c) => {
       const open = searching() || CAT.open.has(c.category), items = CAT.byCat[c.category];
       return [h("div.cathead" + (open ? ".open" : ""), { onclick: async () => {
           if (searching()) return;
