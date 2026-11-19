@@ -371,15 +371,21 @@ async function renderBid(id) {
 }
 
 // ---------------------------------------------------------------- catalog
-const CAT = { q: "", kind: "", offset: 0, limit: 100 };
+const CAT = { q: "", kind: "", cat: null, offset: 0, limit: 100 };
 async function renderCatalog() {
-  const d = await api(`/api/catalog?q=${encodeURIComponent(CAT.q)}&kind=${CAT.kind}&limit=${CAT.limit}&offset=${CAT.offset}`);
+  const d = await api(`/api/catalog?q=${encodeURIComponent(CAT.q)}&kind=${CAT.kind}&limit=${CAT.limit}&offset=${CAT.offset}${CAT.cat != null ? "&cat=" + encodeURIComponent(CAT.cat) : ""}`);
   const total = Object.values(d.counts).reduce((a, b) => a + b, 0);
   const search = h("input", { type: "search", placeholder: "Search manufacturer, model, part #, description, vendor…", value: CAT.q, style: { flex: "1", minWidth: "220px" } });
   let tm; search.addEventListener("input", () => { clearTimeout(tm); tm = setTimeout(() => { CAT.q = search.value; CAT.offset = 0; renderCatalog().then(() => { const s = app.querySelector("input[type=search]"); s.focus(); s.setSelectionRange(s.value.length, s.value.length); }); }, 250); });
   const tab = (k, label) => h("button.tab" + (CAT.kind === k ? ".on" : ""), { onclick: () => { CAT.kind = k; CAT.offset = 0; renderCatalog(); } }, label, h("span.n", k ? d.counts[k] || 0 : total));
   const file = h("input", { type: "file", accept: ".csv,text/csv", hidden: true, onchange: e => { const f = e.target.files[0]; e.target.value = ""; if (f) importDialog(f); } });
-  const rows = d.items.map(it => {
+  const catN = Object.fromEntries(d.cats.map(c => [c.category, c.n]));
+  const catSel = h("select", { onchange: e => { CAT.cat = e.target.value === "__all__" ? null : e.target.value; CAT.offset = 0; renderCatalog(); } },
+    h("option", { value: "__all__" }, "All categories"), d.cats.map(c => h("option", { value: c.category, selected: CAT.cat === c.category }, `${c.category || "No category"} (${c.n})`)));
+  if (CAT.cat != null && !d.cats.some(c => c.category === CAT.cat)) catSel.append(h("option", { value: CAT.cat, selected: true }, CAT.cat || "No category"));
+  let lastCat = null; const rows = [];
+  d.items.forEach(it => { const c = it.category || ""; if (c !== lastCat) { lastCat = c; rows.push(h("tr.grp", h("td", { colspan: 8 }, c || "No category", h("span.muted", { style: { fontWeight: 500, marginLeft: "8px" } }, `${catN[c] || 0} item${catN[c] === 1 ? "" : "s"}`)))); } rows.push(itemRow(it)); });
+  function itemRow(it) {
     const price = it.kind === "package" ? it.rollup && it.rollup.price : it.unit_price;
     const cost = it.kind === "package" ? it.rollup && it.rollup.cost : it.unit_cost;
     const lab = it.kind === "package" ? Object.entries((it.rollup || {}).labor || {}).map(([c, s]) => ({ cost_code: c, seconds: s })) : it.labor;
@@ -387,10 +393,10 @@ async function renderCatalog() {
       h("td", h("span.pill." + it.kind, KIND_LABEL[it.kind])),
       h("td", h("b", [it.manufacturer, it.model].filter(Boolean).join(" ")), it.part_number ? h("div.muted.small", "#" + it.part_number) : null),
       h("td", h("div.desc", it.short_desc || "")),
-      h("td.muted.small", [it.category, it.subcategory].filter(Boolean).join(" / ")),
+      h("td.muted.small", it.subcategory || ""),
       h("td.num", money(cost)), h("td.num", price == null ? h("span.muted", "at rate") : money(price)),
       h("td.small", laborText(lab)), h("td.muted.small", it.vendor || ""));
-  });
+  }
   const pages = Math.ceil(d.total / CAT.limit), pg = Math.floor(CAT.offset / CAT.limit) + 1;
   show(
     h("div.row", h("h1.grow", "Catalog"),
@@ -401,9 +407,9 @@ async function renderCatalog() {
       h("button.btn.pri", { onclick: () => file.click() }, "Import D-Tools catalog"), file),
     !total ? h("div.note.warn", "The catalog is empty. Export your catalog from D-Tools SI (Product Explorer, export to CSV) and click Import D-Tools catalog. Old D-Tools labor codes are converted to your cost codes as they come in.") : null,
     h("div.tabs", tab("", "All"), tab("product", "Products"), tab("labor", "Labor items"), tab("service", "Service items"), tab("package", "Packages")),
-    h("div.row", { style: { marginBottom: "10px" } }, search),
+    h("div.row", { style: { marginBottom: "10px" } }, search, catSel),
     h("div.card", h("div.wrap", { style: { maxHeight: "calc(100vh - 290px)" } }, h("table",
-      h("thead", h("tr", h("th", "Type"), h("th", "Item"), h("th", "Description"), h("th", "Category"), h("th.num", "Cost"), h("th.num", "Sell"), h("th", "Labor (H:M:S)"), h("th", "Vendor"))),
+      h("thead", h("tr", h("th", "Type"), h("th", "Item"), h("th", "Description"), h("th", "Subcategory"), h("th.num", "Cost"), h("th.num", "Sell"), h("th", "Labor (H:M:S)"), h("th", "Vendor"))),
       h("tbody", rows.length ? rows : h("tr", h("td", { colspan: 8 }, h("span.muted", CAT.q ? "Nothing matches that search." : "Nothing here yet."))))))),
     pages > 1 ? h("div.row", h("span.muted.small", `${d.total.toLocaleString()} items · page ${pg} of ${pages}`), h("span.grow"),
       h("button.btn.sm", { disabled: pg <= 1, onclick: () => { CAT.offset -= CAT.limit; renderCatalog(); } }, "Previous"),

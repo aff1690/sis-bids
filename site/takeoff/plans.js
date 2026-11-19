@@ -92,14 +92,26 @@ function trackDevicePatches(ctx) {
 const devicePayload = (d) => ({ item_id: d.item_id ?? null, type: d.type, sheet_id: d.sheet_id, x: d.x, y: d.y, room_id: d.room_id, zone_id: d.zone_id, status: d.status, source: d.source, confidence: d.confidence, note: d.note });
 // ---- SIS Bids catalog on the plans (Tony, 2026-11-19): pick a product or package from the bid catalog and click (or drag it)
 // onto the drawing. The marker counts as that exact item in the bid; its device type still drives circuits, zoning and layers.
-const CAT = { q: "", kind: "", items: [], cache: new Map(), typeFor: {}, loaded: false };
+const CAT = { q: "", kind: "", items: [], cats: [], open: new Set(), byCat: {}, cache: new Map(), typeFor: {}, loaded: false };
 const KIND_LABEL = { product: "Product", labor: "Labor", service: "Service", package: "Package" };
 const itemName = (it) => it ? [it.manufacturer, it.model].filter(Boolean).join(" ") : "";
 async function bidApi(path, opts = {}) { // the bid site's own API (not the takeoff's /api/takeoff/…)
   const r = await fetch(path, { ...opts, headers: { "Content-Type": "application/json", ...(opts.headers || {}) } });
   const b = await r.json().catch(() => null); if (!r.ok) throw new Error(b?.error || `Something went wrong (${r.status}).`); return b;
 }
-async function catSearch() { const r = await bidApi(`/api/catalog?q=${encodeURIComponent(CAT.q)}&kind=${CAT.kind}&limit=40`); CAT.items = r.items; for (const it of r.items) CAT.cache.set(it.id, it); CAT.loaded = true; }
+// grouped by category (Tony, 2026-11-19): with no search the categories show closed and load when opened; a search shows matches grouped
+async function catSearch() {
+  const r = await bidApi(`/api/catalog?q=${encodeURIComponent(CAT.q)}&kind=${CAT.kind}&limit=${CAT.q.trim() ? 150 : 1}`);
+  CAT.cats = r.cats || []; CAT.byCat = {}; CAT.items = CAT.q.trim() ? r.items : [];
+  for (const it of CAT.items) { CAT.cache.set(it.id, it); (CAT.byCat[it.category || ""] ||= []).push(it); }
+  CAT.loaded = true;
+  await Promise.all([...CAT.open].filter((c) => !CAT.byCat[c] && CAT.cats.some((x) => x.category === c)).map(loadCat));
+}
+async function loadCat(c) {
+  const r = await bidApi(`/api/catalog?kind=${CAT.kind}&cat=${encodeURIComponent(c)}&limit=300`);
+  for (const it of r.items) CAT.cache.set(it.id, it);
+  CAT.byCat[c] = r.items;
+}
 async function itemInfo(id) { if (!CAT.cache.has(id)) { try { CAT.cache.set(id, (await bidApi(`/api/catalog/${id}`)).item); } catch { CAT.cache.set(id, null); } } return CAT.cache.get(id); }
 let revMap = null; // catalog item id -> the device type Settings links it to
 async function typeFor(it, types) {
@@ -133,7 +145,22 @@ function buildCatalogPanel(sheet, devices, types, ctx) {
     ondragstart: (e) => { e.dataTransfer.setData("application/x-sis-item", String(it.id)); e.dataTransfer.effectAllowed = "copy"; },
     onclick: () => pick(it),
   }, h("span.kpill." + it.kind, KIND_LABEL[it.kind] || it.kind), h("span.grow", h("b", itemName(it)), it.short_desc ? h("div.muted", { style: { fontSize: ".75rem" } }, it.short_desc.slice(0, 80)) : null));
-  const draw = () => list.replaceChildren(...(CAT.items.length ? CAT.items.map(row) : [h("p.muted", CAT.loaded ? (CAT.q ? "Nothing matches." : "The catalog is empty.") : "Loading…")]));
+  const searching = () => !!CAT.q.trim();
+  const draw = () => {
+    if (!CAT.loaded) return list.replaceChildren(h("p.muted", "Loading…"));
+    const cats = searching() ? CAT.cats.filter((c) => CAT.byCat[c.category]) : CAT.cats;
+    if (!cats.length) return list.replaceChildren(h("p.muted", searching() ? "Nothing matches." : "The catalog is empty."));
+    list.replaceChildren(...cats.flatMap((c) => {
+      const open = searching() || CAT.open.has(c.category), items = CAT.byCat[c.category];
+      return [h("div.cathead" + (open ? ".open" : ""), { onclick: async () => {
+          if (searching()) return;
+          if (CAT.open.has(c.category)) CAT.open.delete(c.category);
+          else { CAT.open.add(c.category); if (!CAT.byCat[c.category]) { try { await loadCat(c.category); } catch (e) { toast(e.message, true); } } }
+          draw();
+        } }, h("span.caret", open ? "▾" : "▸"), h("span.grow", c.category || "No category"), h("span.muted", searching() ? `${items.length}` : `${c.n}`)),
+        ...(open ? (items ? items.map(row) : [h("p.muted", "Loading…")]) : [])];
+    }));
+  };
   if (!CAT.loaded) catSearch().then(draw).catch((e) => list.replaceChildren(h("p.muted", e.message)));
   const q = h("input", { type: "search", placeholder: "Search products and packages…", value: CAT.q, style: { width: "100%" } });
   let t; q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(async () => { CAT.q = q.value; try { await catSearch(); draw(); } catch (e) { toast(e.message, true); } }, 250); });

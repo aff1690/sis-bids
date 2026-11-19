@@ -360,12 +360,16 @@ async function catalogApi(req, env, url, me) {
     if (KINDS.includes(kind)) { where.push("kind = ?"); args.push(kind); }
     if (url.searchParams.get("all") !== "1") where.push("discontinued = 0");
     for (const w of q.split(/\s+/).filter(Boolean).slice(0, 6)) { where.push("(manufacturer || ' ' || model || ' ' || part_number || ' ' || catalog_no || ' ' || category || ' ' || subcategory || ' ' || short_desc || ' ' || vendor) LIKE ?"); args.push("%" + w + "%"); }
+    // grouped by category (Tony, 2026-11-19): items come sorted by category, packages first inside each; cats = count per category
+    const W0 = where.length ? "WHERE " + where.join(" AND ") : "";
+    const cats = ((await env.DB.prepare(`SELECT category, COUNT(*) AS n FROM bid_catalog ${W0} GROUP BY category ORDER BY category = '', category COLLATE NOCASE`).bind(...args).all()).results || []).map(r => ({ category: r.category || "", n: r.n }));
+    if (url.searchParams.has("cat")) { where.push("category = ?"); args.push(str(url.searchParams.get("cat"), 80)); }
     const W = where.length ? "WHERE " + where.join(" AND ") : "";
     const total = (await env.DB.prepare(`SELECT COUNT(*) AS n FROM bid_catalog ${W}`).bind(...args).first()).n;
-    const { results } = await env.DB.prepare(`SELECT * FROM bid_catalog ${W} ORDER BY kind = 'package' DESC, manufacturer, model LIMIT ? OFFSET ?`).bind(...args, lim, off).all();
+    const { results } = await env.DB.prepare(`SELECT * FROM bid_catalog ${W} ORDER BY category = '', category COLLATE NOCASE, kind = 'package' DESC, subcategory COLLATE NOCASE, manufacturer COLLATE NOCASE, model LIMIT ? OFFSET ?`).bind(...args, lim, off).all();
     const rows = results || [], labor = await laborOf(env, rows.map(r => r.id)), pk = rows.filter(r => r.kind === "package").map(r => r.id), ru = pk.length ? await rollup(env, pk) : {};
     const counts = Object.fromEntries(((await env.DB.prepare("SELECT kind, COUNT(*) AS n FROM bid_catalog WHERE discontinued = 0 GROUP BY kind").all()).results || []).map(r => [r.kind, r.n]));
-    return json({ total, counts, items: rows.map(r => ({ ...outItem(r, labor), ...(ru[r.id] ? { rollup: ru[r.id] } : {}) })) });
+    return json({ total, counts, cats, items: rows.map(r => ({ ...outItem(r, labor), ...(ru[r.id] ? { rollup: ru[r.id] } : {}) })) });
   }
   if (p === "/api/catalog" && req.method === "POST") { const b = await req.json().catch(() => null); if (!b) return bad("Bad request"); return saveItem(env, me, 0, b); }
   if (p === "/api/catalog/import" && req.method === "POST") {
