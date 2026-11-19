@@ -89,7 +89,91 @@ function trackDevicePatches(ctx) {
     return orig(id, body);
   };
 }
-const devicePayload = (d) => ({ type: d.type, sheet_id: d.sheet_id, x: d.x, y: d.y, room_id: d.room_id, zone_id: d.zone_id, status: d.status, source: d.source, confidence: d.confidence, note: d.note });
+const devicePayload = (d) => ({ item_id: d.item_id ?? null, type: d.type, sheet_id: d.sheet_id, x: d.x, y: d.y, room_id: d.room_id, zone_id: d.zone_id, status: d.status, source: d.source, confidence: d.confidence, note: d.note });
+// ---- SIS Bids catalog on the plans (Tony, 2026-11-19): pick a product or package from the bid catalog and click (or drag it)
+// onto the drawing. The marker counts as that exact item in the bid; its device type still drives circuits, zoning and layers.
+const CAT = { q: "", kind: "", items: [], cache: new Map(), typeFor: {}, loaded: false };
+const KIND_LABEL = { product: "Product", labor: "Labor", service: "Service", package: "Package" };
+const itemName = (it) => it ? [it.manufacturer, it.model].filter(Boolean).join(" ") : "";
+async function bidApi(path, opts = {}) { // the bid site's own API (not the takeoff's /api/takeoff/…)
+  const r = await fetch(path, { ...opts, headers: { "Content-Type": "application/json", ...(opts.headers || {}) } });
+  const b = await r.json().catch(() => null); if (!r.ok) throw new Error(b?.error || `Something went wrong (${r.status}).`); return b;
+}
+async function catSearch() { const r = await bidApi(`/api/catalog?q=${encodeURIComponent(CAT.q)}&kind=${CAT.kind}&limit=40`); CAT.items = r.items; for (const it of r.items) CAT.cache.set(it.id, it); CAT.loaded = true; }
+async function itemInfo(id) { if (!CAT.cache.has(id)) { try { CAT.cache.set(id, (await bidApi(`/api/catalog/${id}`)).item); } catch { CAT.cache.set(id, null); } } return CAT.cache.get(id); }
+let revMap = null; // catalog item id -> the device type Settings links it to
+async function typeFor(it, types) {
+  if (CAT.typeFor[it.id]) return CAT.typeFor[it.id];
+  if (!revMap) { revMap = {}; try { for (const t of (await bidApi("/api/takeoff-types")).types) if (t.item) revMap[t.item.id] ??= t.key; } catch { /* no access */ } }
+  if (revMap[it.id]) return revMap[it.id];
+  const txt = `${it.category} ${it.subcategory} ${it.system} ${it.short_desc} ${it.model}`.toLowerCase(), has = (k) => types.some((t) => t.key === k);
+  const guess = [[/shower|wet/, "recessed_wet"], [/adjust|gimbal|direction/, "recessed_directional"], [/recess|downlight|can light|\bcan\b/, "recessed"], [/pendant|chandelier/, "pendant"],
+    [/sconce/, "sconce"], [/ceiling fan/, "ceiling_fan"], [/exhaust|bath fan/, "exhaust_fan"], [/tape|strip|linear|under.?cabinet/, "under_cabinet"], [/track/, "track_light"],
+    [/keypad/, "keypad"], [/dimmer/, "switch_dimmer"], [/3.?way/, "switch_3way"], [/switch/, "switch"], [/gfci|gfi/, "receptacle_gfci"], [/usb/, "receptacle_usb"],
+    [/receptacle|outlet/, "receptacle"], [/smoke|co detector|carbon/, "smoke_co"], [/occupancy|vacancy|motion/, "motion_sensor"]].find(([re, k]) => re.test(txt) && has(k));
+  return guess ? guess[1] : "other";
+}
+async function placeItem(ctx, sheet, pi, x, y) {
+  try {
+    const d = await api(`/api/jobs/${ctx.data.job.id}/devices`, { json: { type: pi.type, item_id: pi.id, sheet_id: sheet.id, x, y } });
+    ctx.data.devices.push(d);
+    pushUndo(`add ${pi.label}`, () => api(`/api/devices/${d.id}`, { method: "DELETE" }));
+    ctx.rerender();
+  } catch (err) { toast(err.message, true); }
+}
+function buildCatalogPanel(sheet, devices, types, ctx) {
+  const list = h("div.catlist");
+  const pick = async (it) => {
+    if (ui.placeItem?.id === it.id) ui.placeItem = null;
+    else { ui.placeItem = { id: it.id, label: itemName(it), kind: it.kind, type: await typeFor(it, types) }; ui.placeType = null; ui.placeEquip = null; ui.selected = null; }
+    ctx.rerender();
+  };
+  const row = (it) => h("div.catrow" + (ui.placeItem?.id === it.id ? ".active" : ""), {
+    draggable: "true", title: "Click it, then click the plan to place it. Or drag it onto the plan.",
+    ondragstart: (e) => { e.dataTransfer.setData("application/x-sis-item", String(it.id)); e.dataTransfer.effectAllowed = "copy"; },
+    onclick: () => pick(it),
+  }, h("span.kpill." + it.kind, KIND_LABEL[it.kind] || it.kind), h("span.grow", h("b", itemName(it)), it.short_desc ? h("div.muted", { style: { fontSize: ".75rem" } }, it.short_desc.slice(0, 80)) : null));
+  const draw = () => list.replaceChildren(...(CAT.items.length ? CAT.items.map(row) : [h("p.muted", CAT.loaded ? (CAT.q ? "Nothing matches." : "The catalog is empty.") : "Loading…")]));
+  if (!CAT.loaded) catSearch().then(draw).catch((e) => list.replaceChildren(h("p.muted", e.message)));
+  const q = h("input", { type: "search", placeholder: "Search products and packages…", value: CAT.q, style: { width: "100%" } });
+  let t; q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(async () => { CAT.q = q.value; try { await catSearch(); draw(); } catch (e) { toast(e.message, true); } }, 250); });
+  const tab = (k, label) => h("button.small" + (CAT.kind === k ? ".active" : ""), { onclick: async () => { CAT.kind = k; await catSearch(); ctx.rerender(); } }, label);
+  // what's placed from the catalog on this sheet
+  const byItem = {}; for (const d of devices) if (d.item_id) byItem[d.item_id] = (byItem[d.item_id] || 0) + 1;
+  const missing = Object.keys(byItem).map(Number).filter((id) => !CAT.cache.has(id));
+  if (missing.length) Promise.all(missing.map(itemInfo)).then(() => ctx.rerender());
+  draw();
+  return h("div.section",
+    h("h3", "Catalog & packages"),
+    h("div.row", { style: { gap: "4px", marginBottom: "6px" } }, tab("", "All"), tab("product", "Products"), tab("package", "Packages")),
+    q,
+    ui.placeItem ? h("div.placing-item",
+      h("div", "Placing ", h("b", ui.placeItem.label), ". Click the plan; Esc to stop."),
+      h("label.muted", { style: { fontSize: ".75rem" } }, "Counts as (for circuits, zoning and layers)"),
+      h("select", { style: { width: "100%" }, onchange: (e) => { ui.placeItem.type = CAT.typeFor[ui.placeItem.id] = e.target.value; } },
+        types.map((x) => h("option", { value: x.key, selected: x.key === ui.placeItem.type }, x.label)))) : null,
+    list,
+    Object.keys(byItem).length ? [h("h4", { style: { margin: "10px 0 4px", fontSize: ".8rem" } }, "From the catalog on this sheet"),
+      Object.entries(byItem).map(([id, n]) => h("div.typecount", h("span", itemName(CAT.cache.get(Number(id))) || `Item ${id}`), h("strong", n)))] : null);
+}
+// the selected marker's catalog item: search to set it, or clear it so the device type's default from Settings is used
+function itemPicker(sel, ctx) {
+  const cur = sel.item_id ? CAT.cache.get(sel.item_id) : null;
+  if (sel.item_id && !CAT.cache.has(sel.item_id)) itemInfo(sel.item_id).then(() => ctx.rerender());
+  const q = h("input", { type: "search", placeholder: cur ? "Change…" : "Search the catalog…", style: { width: "100%" } }), drop = h("div.catlist", { hidden: true });
+  let t; q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(async () => {
+    if (!q.value.trim()) { drop.hidden = true; return; }
+    const r = await bidApi(`/api/catalog?q=${encodeURIComponent(q.value)}&limit=12`).catch(() => ({ items: [] }));
+    for (const it of r.items) CAT.cache.set(it.id, it);
+    drop.replaceChildren(...(r.items.length ? r.items.map((it) => h("div.catrow", { onclick: () => ctx.patchDevice(sel.id, { item_id: it.id, status: "confirmed" }) },
+      h("span.kpill." + it.kind, KIND_LABEL[it.kind] || it.kind), h("b.grow", itemName(it)))) : [h("p.muted", "Nothing matches.")]));
+    drop.hidden = false; }, 250); });
+  return [h("label.muted", { style: { fontSize: ".8rem" } }, "Catalog item in the bid"),
+    h("div.row", { style: { gap: "6px", margin: "2px 0 4px" } }, cur ? h("span.grow", h("span.kpill." + cur.kind, KIND_LABEL[cur.kind]), " ", itemName(cur)) : h("span.grow.muted", "The default for this device type (Settings)"),
+      sel.item_id ? h("button.small", { onclick: () => ctx.patchDevice(sel.id, { item_id: null }) }, "Clear") : null),
+    q, drop];
+}
+
 async function deleteDevice(ctx, d) {
   await api(`/api/devices/${d.id}`, { method: "DELETE" });
   ctx.data.devices = ctx.data.devices.filter((x) => x.id !== d.id);
@@ -321,7 +405,7 @@ export function renderPlans(root, ctx) {
 // Tool windows: every inspector section opens as a floating window (Tools menu). Windows are dragged by their
 // title bar, resized from the corner, and keep their position / size / open state between visits.
 const TOOL_WINDOWS = [
-  ["panels & risers", "Panels & risers"], ["claude analysis", "Claude analysis"], ["code check", "Code check"],
+  ["catalog & packages", "Catalog & packages"], ["panels & risers", "Panels & risers"], ["claude analysis", "Claude analysis"], ["code check", "Code check"],
   ["led tape", "LED tape"], ["lighting zones", "Lighting zones"], ["on this sheet", "On this sheet"],
   ["add devices by hand", "Add devices by hand"], ["sheet info", "Sheet info"],
 ];
@@ -331,7 +415,8 @@ let zTop = 30;
 const toolScroll = {};
 const saveWin = () => { try { localStorage.setItem("takeoff.windows", JSON.stringify(ui.win)); } catch { /* storage blocked */ } };
 function winState(key, i) {
-  if (!ui.win[key]) ui.win[key] = { open: key === "claude analysis", x: Math.max(10, innerWidth - 360 - i * 24), y: 110 + i * 28, w: 340, h: 440 };
+  if (!ui.win[key]) ui.win[key] = key === "catalog & packages" ? { open: true, x: 10, y: 170, w: 340, h: 520 }
+    : { open: key === "claude analysis", x: Math.max(10, innerWidth - 360 - i * 24), y: 110 + i * 28, w: 340, h: 440 };
   return ui.win[key];
 }
 
@@ -491,7 +576,7 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
   const viewer = h("div.viewer");
   const stage = h("div.stage");
   const canvas = h("canvas");
-  const overlay = h("div.overlay" + (ui.placeType || ui.placeEquip || ui.drawTape ? ".placing" : ""));
+  const overlay = h("div.overlay" + (ui.placeType || ui.placeItem || ui.placeEquip || ui.drawTape ? ".placing" : ""));
   stage.append(canvas, overlay);
   viewer.append(stage);
 
@@ -605,9 +690,9 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
         else if (d.zone_id && zc.has(d.zone_id)) { bg = zc.get(d.zone_id); if (ui.activeZone && d.zone_id !== ui.activeZone) opacity = 0.45; }
         else { bg = "#9ca3af"; label = "?"; }
       }
-      const m = h("div.marker" + (d.status === "pending" ? ".pending" : "") + (d.source === "code" ? ".code" : "") + (d.id === ui.selected ? ".selected" : ""), {
+      const m = h("div.marker" + (d.status === "pending" ? ".pending" : "") + (d.source === "code" ? ".code" : "") + (d.item_id ? ".itm" : "") + (d.id === ui.selected ? ".selected" : ""), {
         style: { left: `${d.x * z}px`, top: `${d.y * z}px`, background: bg, ...(opacity != null ? { opacity } : {}) },
-        title: `${t.label}${d.zone_id ? " · zone: " + (zoneName.get(d.zone_id) || "") : ""}${d.note ? " — " + d.note : ""}${d.confidence != null ? ` (${Math.round(d.confidence * 100)}%)` : ""}`,
+        title: `${d.item_id && CAT.cache.get(d.item_id) ? itemName(CAT.cache.get(d.item_id)) + " · " : ""}${t.label}${d.zone_id ? " · zone: " + (zoneName.get(d.zone_id) || "") : ""}${d.note ? " — " + d.note : ""}${d.confidence != null ? ` (${Math.round(d.confidence * 100)}%)` : ""}`,
       }, label);
       m.dataset.id = d.id;
       attachDrag(m, d);
@@ -857,6 +942,7 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
       } catch (err) { toast(err.message, true); }
       return;
     }
+    if (ui.placeItem) { await placeItem(ctx, sheet, ui.placeItem, x, y); return; }
     if (!ui.placeType) { if (ui.selected || ui.selectedEquip) { ui.selected = null; ui.selectedEquip = null; ctx.rerender(); } return; }
     try {
       const d = await api(`/api/jobs/${data.job.id}/devices`, { json: { type: ui.placeType, sheet_id: sheet.id, x, y } });
@@ -864,6 +950,16 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
       pushUndo(`add ${typeMap[d.type]?.label || "device"}`, () => api(`/api/devices/${d.id}`, { method: "DELETE" }));
       ctx.rerender();
     } catch (err) { toast(err.message, true); }
+  });
+
+  // a catalog item dragged from the Catalog & packages window
+  overlay.addEventListener("dragover", (e) => { if (e.dataTransfer.types.includes("application/x-sis-item")) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } });
+  overlay.addEventListener("drop", async (e) => {
+    const id = Number(e.dataTransfer.getData("application/x-sis-item")); if (!id) return;
+    e.preventDefault();
+    const rect = overlay.getBoundingClientRect(), x = (e.clientX - rect.left) / ui.zoom, y = (e.clientY - rect.top) / ui.zoom;
+    const it = await itemInfo(id); if (!it) return toast("That catalog item is gone.", true);
+    await placeItem(ctx, sheet, { id, label: itemName(it), type: await typeFor(it, ctx.types) }, x, y);
   });
 
   // LED tape drawing: live preview of the next segment, double-click to finish.
@@ -928,6 +1024,7 @@ function buildInspector(sheet, devices, data, types, typeMap, roomsById, ctx) {
       h("label.muted", { style: { fontSize: ".8rem" } }, "Type"),
       h("select", { style: { width: "100%" }, onchange: (e) => ctx.patchDevice(sel.id, { type: e.target.value, status: "confirmed" }) },
         types.map((x) => h("option", { value: x.key, selected: x.key === sel.type }, x.label))),
+      itemPicker(sel, ctx),
       h("label.muted", { style: { fontSize: ".8rem" } }, "Room"),
       h("select", { style: { width: "100%" }, onchange: (e) => ctx.patchDevice(sel.id, { room_id: e.target.value ? Number(e.target.value) : null }) },
         h("option", { value: "" }, "— Unassigned —"),
@@ -1034,11 +1131,12 @@ function buildInspector(sheet, devices, data, types, typeMap, roomsById, ctx) {
     ) : h("p.muted", "No devices yet."),
   ));
 
+  out.push(buildCatalogPanel(sheet, devices, types, ctx));
   // --- palette ---
   out.push(h("div.section",
     h("h3", "Add devices by hand"),
     h("div.palette", types.map((t) => h("button" + (ui.placeType === t.key ? ".active" : ""), {
-      title: t.label, onclick: () => { ui.placeType = ui.placeType === t.key ? null : t.key; ui.selected = null; ctx.rerender(); },
+      title: t.label, onclick: () => { ui.placeType = ui.placeType === t.key ? null : t.key; ui.placeItem = null; ui.selected = null; ctx.rerender(); },
     }, h("span.swatch", { style: { background: t.color } }), t.label))),
   ));
 
@@ -1251,7 +1349,7 @@ export function handlePlanKeys(e, ctx) {
   }
   const isDelete = e.key === "Delete" || e.key === "Backspace";
   if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z")) { e.preventDefault(); undoLast(ctx); }
-  else if (e.key === "Escape") { ui.placeType = null; ui.placeEquip = null; ui.selected = null; ui.selectedEquip = null; ui.selectedTape = null; ui.activeZone = null; ctx.rerender(); }
+  else if (e.key === "Escape") { ui.placeType = null; ui.placeItem = null; ui.placeEquip = null; ui.selected = null; ui.selectedEquip = null; ui.selectedTape = null; ui.activeZone = null; ctx.rerender(); }
   else if (isDelete && ui.selected) {
     // Delete removes whatever is selected; Ctrl+Z / Undo brings it back.
     e.preventDefault();

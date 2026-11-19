@@ -523,7 +523,12 @@ async function takeoffSync(env, me, bid) {
   if (!tid) return bad("This bid has no takeoff yet.");
   const tj = await DB.prepare("SELECT id FROM bto_jobs WHERE id = ?").bind(tid).first().catch(() => null); if (!tj) return bad("This bid's takeoff is gone.");
   const trooms = (await DB.prepare("SELECT id, level, number, name FROM bto_rooms WHERE job_id = ? ORDER BY level, number, name").bind(tid).all()).results || [];
-  const counts = (await DB.prepare("SELECT room_id, type, COUNT(*) AS n, SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pend FROM bto_devices WHERE job_id = ? GROUP BY room_id, type").bind(tid).all()).results || [];
+  // markers placed as a catalog item (item_id) count as that item; the rest use their device type's item from Settings
+  const counts = (await DB.prepare("SELECT room_id, type, item_id, COUNT(*) AS n, SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pend FROM bto_devices WHERE job_id = ? GROUP BY room_id, type, item_id").bind(tid).all()
+    .catch(() => DB.prepare("SELECT room_id, type, NULL AS item_id, COUNT(*) AS n, SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pend FROM bto_devices WHERE job_id = ? GROUP BY room_id, type").bind(tid).all())).results || [];
+  // several device types can share one item: merge rows that land on the same line
+  const merged = {};
+  for (const c of counts) { const k = `${c.room_id || 0}:${c.item_id ? "i" + c.item_id : c.type}`; const m = merged[k] ||= { ...c, n: 0, pend: 0 }; m.n += c.n; m.pend += c.pend || 0; }
   const brooms = (await DB.prepare("SELECT * FROM bid_rooms WHERE bid_id = ?").bind(bid.id).all()).results || [];
   const byKey = {}; for (const r of brooms) if (r.src_key) byKey[r.src_key] = r;
   let sort = Date.now(), roomsAdded = 0; const keep = new Set();
@@ -540,9 +545,9 @@ async function takeoffSync(env, me, bid) {
   const dmap = await deviceMap(env), cache = {}, unmapped = new Set(); let pending = 0;
   const old = (await DB.prepare("SELECT id, src_key, item_id FROM bid_lines WHERE bid_id = ? AND source = 'takeoff'").bind(bid.id).all()).results || [];
   const oldBy = Object.fromEntries(old.map(l => [l.src_key, l])), st = [], seen = new Set();
-  for (const c of counts) {
+  for (const [key, c] of Object.entries(merged)) {
     pending += c.pend || 0;
-    const key = `${c.room_id || 0}:${c.type}`, itemId = dmap[c.type] ? Math.floor(numOr(dmap[c.type])) : null, room = c.room_id ? roomOf[c.room_id] || null : null;
+    const itemId = c.item_id ? Math.floor(numOr(c.item_id)) : dmap[c.type] ? Math.floor(numOr(dmap[c.type])) : null, room = c.room_id ? roomOf[c.room_id] || null : null;
     if (!itemId) unmapped.add(c.type);
     seen.add(key); const prev = oldBy[key];
     if (prev && (prev.item_id || null) === itemId) { st.push(DB.prepare("UPDATE bid_lines SET qty = ?, room_id = ? WHERE id = ?").bind(c.n, room, prev.id)); continue; }
@@ -559,7 +564,7 @@ async function takeoffSync(env, me, bid) {
     .filter(r => !keep.has(r.src_key)).sort((a, b) => (a.src_key.startsWith("to:L:") ? 1 : 0) - (b.src_key.startsWith("to:L:") ? 1 : 0));
   for (const r of left) { if (!r.n && !r.kids) { await DB.prepare("DELETE FROM bid_rooms WHERE id = ?").bind(r.id).run(); roomsGone++; } else await DB.prepare("UPDATE bid_rooms SET src_key = '' WHERE id = ?").bind(r.id).run(); }
   await touch(env, me, bid.id);
-  return json({ ok: true, rooms: trooms.length, roomsAdded, roomsGone, lines: counts.length, devices: counts.reduce((a, c) => a + c.n, 0), pending, unmapped: [...unmapped].map(k => ({ key: k, label: TYPE_LABEL[k] || k })) });
+  return json({ ok: true, rooms: trooms.length, roomsAdded, roomsGone, lines: Object.keys(merged).length, devices: counts.reduce((a, c) => a + c.n, 0), pending, unmapped: [...unmapped].map(k => ({ key: k, label: TYPE_LABEL[k] || k })) });
 }
 // renaming a bid room that came from the takeoff renames it there too (the room number stays)
 async function renameTakeoffRoom(env, rm, name) {

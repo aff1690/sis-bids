@@ -207,3 +207,14 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
   .tool-window { max-width: calc(100vw - 16px); }
   .tabs a { padding: 8px 8px 6px; font-size: 14px; }
 }
+
+/* SIS Bids: catalog & packages on the plans */
+.catlist { display: grid; gap: 2px; margin-top: 6px; }
+.catrow { display: flex; gap: 6px; align-items: flex-start; padding: 5px 6px; border-radius: 6px; cursor: grab; font-size: .82rem; border: 1px solid transparent; }
+.catrow:hover { background: color-mix(in srgb, var(--gold, #eba91f) 10%, transparent); }
+.catrow.active { border-color: var(--gold, #eba91f); background: color-mix(in srgb, var(--gold, #eba91f) 16%, transparent); }
+.kpill { flex: none; font-size: .68rem; font-weight: 600; padding: 1px 6px; border-radius: 99px; background: rgba(128,128,128,.18); }
+.kpill.package { background: rgba(46,125,79,.18); color: #2e7d4f; }
+.placing-item { margin: 8px 0; padding: 8px; border-radius: 8px; border: 1px solid var(--gold, #eba91f); font-size: .82rem; display: grid; gap: 4px; }
+button.small.active { outline: 2px solid var(--gold, #eba91f); }
+.marker.itm { box-shadow: 0 0 0 2px #fff, 0 0 0 4px #2e7d4f; }

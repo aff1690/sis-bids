@@ -329,10 +329,10 @@ on("POST", "/jobs/:id/devices", async ({ req, params }) => {
   const roomId = b.room_id ?? (b.sheet_id && b.x != null ? await nearestRoomId(b.sheet_id, b.x, b.y) : null);
   const zoneOk = b.zone_id && await db.prepare("SELECT 1 FROM zones WHERE id = ?").get(b.zone_id);
   // source / status / confidence / zone are accepted so an undo can restore a deleted device as it was.
-  return db.prepare(`INSERT INTO devices (job_id, sheet_id, room_id, zone_id, type, x, y, source, status, confidence, note)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).get(params.id, b.sheet_id ?? null, roomId, zoneOk ? b.zone_id : null,
+  return db.prepare(`INSERT INTO devices (job_id, sheet_id, room_id, zone_id, type, x, y, source, status, confidence, note, item_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).get(params.id, b.sheet_id ?? null, roomId, zoneOk ? b.zone_id : null,
     b.type, b.x ?? null, b.y ?? null, ["ai", "manual", "code"].includes(b.source) ? b.source : "manual", b.status === "pending" ? "pending" : "confirmed",
-    b.confidence ?? null, b.note || "");
+    b.confidence ?? null, b.note || "", Number(b.item_id) > 0 ? Math.floor(Number(b.item_id)) : null);
 });
 on("PATCH", "/devices/:id", async ({ req, params }) => {
   const d = await db.prepare("SELECT * FROM devices WHERE id = ?").get(params.id);
@@ -351,8 +351,9 @@ on("PATCH", "/devices/:id", async ({ req, params }) => {
     }
     zoneId = null; // moved into another room: it leaves the old room's zone
   }
-  await db.prepare("UPDATE devices SET type = ?, x = ?, y = ?, status = ?, note = ?, room_id = ?, zone_id = ? WHERE id = ?")
-    .run(b.type ?? d.type, b.x ?? d.x, b.y ?? d.y, b.status ?? d.status, b.note ?? d.note, roomId, zoneId, d.id);
+  const itemId = b.item_id !== undefined ? (Number(b.item_id) > 0 ? Math.floor(Number(b.item_id)) : null) : d.item_id ?? null;
+  await db.prepare("UPDATE devices SET type = ?, x = ?, y = ?, status = ?, note = ?, room_id = ?, zone_id = ?, item_id = ? WHERE id = ?")
+    .run(b.type ?? d.type, b.x ?? d.x, b.y ?? d.y, b.status ?? d.status, b.note ?? d.note, roomId, zoneId, itemId, d.id);
   if (zoneId && zone && !zone.room_id && roomId) { // a new zone takes the room of its first light
     await db.prepare("UPDATE zones SET room_id = ? WHERE id = ?").run(roomId, zoneId);
     await renumberZones(d.job_id);

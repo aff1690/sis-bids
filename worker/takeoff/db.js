@@ -196,6 +196,7 @@ const MIGRATIONS = [
   ["rooms", "auto_number", "INTEGER DEFAULT 0"],
   ["equipment", "target_id", "INTEGER"],
   ["sheets", "replaced_by", "INTEGER"],
+  ["devices", "item_id", "INTEGER"],               // SIS Bids catalog item or package this marker counts as (2026-11-19)
   ["zones", "exterior", "INTEGER DEFAULT 0"],      // exterior wall-face zone (2026-11-09): may span rooms, never split by room          // revision merge (2026-11-09): the newer sheet that replaced this one
 ];
 
