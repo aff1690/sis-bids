@@ -532,9 +532,9 @@ function winState(key, i) {
 
 /** Turn the inspector sections into floating windows. Sections without a heading are the current selection. */
 function buildToolWindows(sections, ctx) {
-  const out = [];
+  const list = [];
   const selection = sections.filter((el) => el && !el.querySelector?.(":scope > h3"));
-  if (selection.length) out.push(toolWindow("selection", "Selected", selection, ctx, 0, true));
+  if (selection.length) { winState("selection", 0).open = true; list.push({ key: "selection", title: "Selected", content: selection, i: 0 }); }
   sections.forEach((el) => {
     const head = el?.querySelector?.(":scope > h3");
     if (!head) return;
@@ -544,12 +544,42 @@ function buildToolWindows(sections, ctx) {
     if (!st.open) return;
     const title = head.textContent;
     head.remove();
-    out.push(toolWindow(key, title, [...el.childNodes], ctx, i));
+    list.push({ key, title, content: [...el.childNodes], i });
   });
+  // Docking (Tony, 2026-11-19): a window dropped on another joins it as a tab. st.dock = the host window's key.
+  const byKey = new Map(list.map((w) => [w.key, w]));
+  const groups = new Map();
+  for (const w of list) {
+    const host = ui.win[w.key]?.dock;
+    const hk = host && byKey.has(host) && !ui.win[host]?.dock ? host : w.key;
+    (groups.get(hk) || groups.set(hk, []).get(hk)).push(w);
+  }
+  const out = [];
+  for (const [hk, members] of groups) {
+    if (members.length === 1) { out.push(toolWindow(hk, members[0].title, members[0].content, ctx, members[0].i)); continue; }
+    const host = ui.win[hk];
+    members.sort((a, b) => (a.key === hk ? -1 : b.key === hk ? 1 : 0));
+    let active = members.find((m) => m.key === host.tab) || members[0];
+    if (byKey.has("selection") && members.some((m) => m.key === "selection") && ui.lastSel !== ui.selected) active = byKey.get("selection"); // a new selection comes to the front
+    ui.lastSel = ui.selected;
+    const tabs = h("div.tool-tabs", members.map((m) => h("div.tool-tab" + (m === active ? ".on" : ""), { onclick: () => { host.tab = m.key; saveWin(); ctx.rerender(); } },
+      h("span", m.title),
+      h("button.undock", { title: "Undock into its own window", onclick: (e) => {
+        e.stopPropagation(); const st = ui.win[m.key];
+        if (m.key === hk) { // the host leaves: the next tab hosts the rest
+          const rest = members.filter((x) => x.key !== hk); const nh = ui.win[rest[0].key];
+          Object.assign(nh, { x: host.x, y: host.y, w: host.w, h: host.h, dock: null, tab: rest[0].key });
+          for (const r of rest.slice(1)) ui.win[r.key].dock = rest[0].key;
+          host.x += 30; host.y += 30;
+        } else { st.dock = null; st.x = host.x + 30; st.y = host.y + 30; st.w = host.w; st.h = host.h; }
+        saveWin(); ctx.rerender();
+      } }, "⇱"))));
+    out.push(toolWindow(hk, active.title, [tabs, ...[].concat(active.content)], ctx, members[0].i, false, members.map((m) => m.key)));
+  }
   return out;
 }
 
-function toolWindow(key, title, content, ctx, i, auto = false) {
+function toolWindow(key, title, content, ctx, i, auto = false, group = null) {
   const st = winState(key, Math.max(0, i));
   if (auto) st.open = true;
   const clamp = () => {
@@ -558,27 +588,50 @@ function toolWindow(key, title, content, ctx, i, auto = false) {
   };
   clamp();
   const win = h("div.tool-window", { style: { left: `${st.x}px`, top: `${st.y}px`, width: `${st.w}px`, height: `${st.h}px`, zIndex: st.z || ++zTop } });
+  win.dataset.key = key;
   const bar = h("div.tool-bar",
-    h("strong.grow", title),
-    h("button.small", { title: "Close", onclick: (e) => {
+    h("strong.grow", title, group ? h("span", { style: { fontSize: "11px", opacity: .6, marginLeft: "8px" } }, `+${group.length - 1} docked`) : null),
+    h("button.small", { title: group ? "Close these windows" : "Close", onclick: (e) => {
       e.stopPropagation();
-      if (key === "selection") { ui.selected = null; ui.selectedEquip = null; ui.selectedTape = null; }
-      else { st.open = false; saveWin(); }
-      ctx.rerender();
+      for (const k of group || [key]) {
+        if (k === "selection") { ui.selected = null; ui.selectedEquip = null; ui.selectedTape = null; }
+        else { ui.win[k].open = false; }
+      }
+      saveWin(); ctx.rerender();
     } }, "×"));
   // Keep each window's scroll position across redraws (e.g. while assigning lights to zones).
   const body = h("div.tool-body", { onscroll: (e) => { toolScroll[key] = e.target.scrollTop; } }, content);
   win.append(bar, body);
   requestAnimationFrame(() => { body.scrollTop = toolScroll[key] || 0; });
   win.addEventListener("pointerdown", () => { st.z = ++zTop; win.style.zIndex = st.z; });
-  // Drag by the title bar.
+  // Drag by the title bar; drop it on another window's title bar or tabs to dock it there.
   bar.addEventListener("pointerdown", (e) => {
     if (e.target.closest("button")) return;
     e.preventDefault();
     bar.setPointerCapture(e.pointerId);
     const sx = e.clientX - st.x, sy = e.clientY - st.y;
-    const move = (ev) => { st.x = ev.clientX - sx; st.y = ev.clientY - sy; clamp(); win.style.left = `${st.x}px`; win.style.top = `${st.y}px`; };
-    const up = () => { bar.removeEventListener("pointermove", move); bar.removeEventListener("pointerup", up); saveWin(); };
+    let target = null;
+    const targetAt = (ev) => {
+      win.style.pointerEvents = "none";
+      const el = document.elementFromPoint(ev.clientX, ev.clientY)?.closest(".tool-window");
+      win.style.pointerEvents = "";
+      return el && el !== win && el.dataset.key ? el : null;
+    };
+    const move = (ev) => {
+      st.x = ev.clientX - sx; st.y = ev.clientY - sy; clamp(); win.style.left = `${st.x}px`; win.style.top = `${st.y}px`;
+      const t = targetAt(ev); if (t !== target) { target?.classList.remove("dock-target"); target = t; target?.classList.add("dock-target"); }
+    };
+    const up = () => {
+      bar.removeEventListener("pointermove", move); bar.removeEventListener("pointerup", up);
+      if (target) {
+        target.classList.remove("dock-target");
+        const hk = target.dataset.key;
+        for (const k of group || [key]) { if (ui.win[k]) ui.win[k].dock = hk; }
+        if (ui.win[hk]) ui.win[hk].tab = key;
+        saveWin(); ctx.rerender(); return;
+      }
+      saveWin();
+    };
     bar.addEventListener("pointermove", move); bar.addEventListener("pointerup", up);
   });
   // Resize from the corner (CSS resize); remember the size.
