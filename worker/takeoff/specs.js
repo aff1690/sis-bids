@@ -545,8 +545,27 @@ export async function renumberZones(jobId) {
   const seq = new Map();
   const upd = db.prepare("UPDATE zones SET code = ? WHERE id = ?");
   const writes = [];
+  // Every zone code carries its room number, K101.01 / D101.01 / 101.01 (Tony, 2026-11-19). A zone with no room takes
+  // the room most of its lights are in, else the room label nearest its lights, else a number at the start of its name.
+  const orphan = zones.filter((z) => !z.exterior && !rooms.get(z.room_id));
+  if (orphan.length) {
+    const devs = await db.prepare("SELECT zone_id, room_id, sheet_id, x, y FROM devices WHERE job_id = ? AND zone_id IS NOT NULL").all(jobId);
+    for (const z of orphan) {
+      const mine = devs.filter((d) => d.zone_id === z.id);
+      const tally = new Map(); for (const d of mine) if (rooms.has(d.room_id)) tally.set(d.room_id, (tally.get(d.room_id) || 0) + 1);
+      let rid = [...tally.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+      const pts = mine.filter((d) => d.x != null);
+      if (!rid && pts.length) {
+        const cx = pts.reduce((a, d) => a + d.x, 0) / pts.length, cy = pts.reduce((a, d) => a + d.y, 0) / pts.length, sid = pts[0].sheet_id;
+        let best = null; for (const r of rooms.values()) if (r.sheet_id === sid && r.x != null) { const dd = Math.hypot(r.x - cx, r.y - cy); if (!best || dd < best.d) best = { id: r.id, d: dd }; }
+        rid = best?.id ?? null;
+      }
+      if (rid) { z.room_id = rid; writes.push(db.prepare("UPDATE zones SET room_id = ? WHERE id = ?").bind(rid, z.id)); }
+    }
+  }
   for (const z of zones) {
-    const base = z.exterior ? "EXT" : roomCode(rooms.get(z.room_id));
+    const named = String(z.name || "").match(/^\s*[KDL]?(\d{2,4}[A-Z]?)(?:\.\d+)?\b/i)?.[1];
+    const base = z.exterior ? "EXT" : rooms.get(z.room_id) ? roomCode(rooms.get(z.room_id)) : named || "Z";
     const n = (seq.get(base) || 0) + 1;
     seq.set(base, n);
     const code = `${ZONE_PREFIX[z.control] || ""}${base}.${String(n).padStart(2, "0")}`;

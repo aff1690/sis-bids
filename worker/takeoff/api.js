@@ -160,6 +160,8 @@ on("GET", "/jobs/:id", async ({ params }) => {
   if (!job) notFound();
   const id = job.id;
   const q = (sql) => db.prepare(sql).all(id);
+  // zones still coded without a room number (e.g. KZ.01) get one (Tony, 2026-11-19)
+  if ((await db.prepare("SELECT COUNT(*) AS n FROM zones WHERE job_id = ? AND exterior = 0 AND code LIKE '%Z.%'").get(id))?.n) await renumberZones(id);
   const [plans, sheets, rooms, devices, zones, equipment, loads, findings, tape, hrs, circuits] = await Promise.all([
     q("SELECT * FROM plans WHERE job_id = ? ORDER BY id"),
     q("SELECT * FROM sheets WHERE job_id = ? ORDER BY plan_id, page"),
@@ -370,7 +372,7 @@ on("PATCH", "/devices/:id", async ({ req, params }) => {
   if (zoneId && zone && !zone.room_id && roomId) { // a new zone takes the room of its first light
     await db.prepare("UPDATE zones SET room_id = ? WHERE id = ?").run(roomId, zoneId);
     await renumberZones(d.job_id);
-  }
+  } else if (zoneId && zone && !zone.room_id) await renumberZones(d.job_id); // lights with no room: the zone finds one from where they sit
   return db.prepare("SELECT * FROM devices WHERE id = ?").get(d.id);
 });
 // Attach a catalog product or package to Claude's counts of one device type (Tony, 2026-11-19): every device of that
