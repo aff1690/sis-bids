@@ -144,7 +144,7 @@ function buildCatalogPanel(sheet, devices, types, ctx) {
     draggable: "true", title: "Click it, then click the plan to place it. Or drag it onto the plan.",
     ondragstart: (e) => { e.dataTransfer.setData("application/x-sis-item", String(it.id)); e.dataTransfer.effectAllowed = "copy"; },
     onclick: () => pick(it),
-  }, h("span.kpill." + it.kind, KIND_LABEL[it.kind] || it.kind), h("span.grow", h("b", itemName(it)), it.short_desc ? h("div.muted", { style: { fontSize: ".75rem" } }, it.short_desc.slice(0, 80)) : null));
+  }, h("span.kpill." + it.kind, KIND_LABEL[it.kind] || it.kind), h("span.grow", h("b", itemName(it)), it.part_number ? h("span.muted", { style: { fontSize: ".75rem" } }, `  #${it.part_number}`) : null, it.short_desc ? h("div.muted", { style: { fontSize: ".75rem" } }, it.short_desc.slice(0, 80)) : null));
   const searching = () => !!CAT.q.trim();
   const draw = () => {
     if (!CAT.loaded) return list.replaceChildren(h("p.muted", "Loading…"));

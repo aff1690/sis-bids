@@ -384,14 +384,15 @@ async function renderCatalog() {
     h("option", { value: "__all__" }, "All categories"), d.cats.map(c => h("option", { value: c.category, selected: CAT.cat === c.category }, `${c.category || "No category"} (${c.n})`)));
   if (CAT.cat != null && !d.cats.some(c => c.category === CAT.cat)) catSel.append(h("option", { value: CAT.cat, selected: true }, CAT.cat || "No category"));
   let lastCat = null; const rows = [];
-  d.items.forEach(it => { const c = it.category || ""; if (c !== lastCat) { lastCat = c; rows.push(h("tr.grp", h("td", { colspan: 8 }, c || "No category", h("span.muted", { style: { fontWeight: 500, marginLeft: "8px" } }, `${catN[c] || 0} item${catN[c] === 1 ? "" : "s"}`)))); } rows.push(itemRow(it)); });
+  d.items.forEach(it => { const c = it.category || ""; if (c !== lastCat) { lastCat = c; rows.push(h("tr.grp", h("td", { colspan: 9 }, c || "No category", h("span.muted", { style: { fontWeight: 500, marginLeft: "8px" } }, `${catN[c] || 0} item${catN[c] === 1 ? "" : "s"}`)))); } rows.push(itemRow(it)); });
   function itemRow(it) {
     const price = it.kind === "package" ? it.rollup && it.rollup.price : it.unit_price;
     const cost = it.kind === "package" ? it.rollup && it.rollup.cost : it.unit_cost;
     const lab = it.kind === "package" ? Object.entries((it.rollup || {}).labor || {}).map(([c, s]) => ({ cost_code: c, seconds: s })) : it.labor;
     return h("tr.click", { onclick: () => editItem(it.id) },
       h("td", h("span.pill." + it.kind, KIND_LABEL[it.kind])),
-      h("td", h("b", [it.manufacturer, it.model].filter(Boolean).join(" ")), it.part_number ? h("div.muted.small", "#" + it.part_number) : null),
+      h("td", h("b", [it.manufacturer, it.model].filter(Boolean).join(" "))),
+      h("td.small", it.part_number || h("span.muted", "—")),
       h("td", h("div.desc", it.short_desc || "")),
       h("td.muted.small", it.subcategory || ""),
       h("td.num", money(cost)), h("td.num", price == null ? h("span.muted", "at rate") : money(price)),
@@ -409,8 +410,8 @@ async function renderCatalog() {
     h("div.tabs", tab("", "All"), tab("product", "Products"), tab("labor", "Labor items"), tab("service", "Service items"), tab("package", "Packages")),
     h("div.row", { style: { marginBottom: "10px" } }, search, catSel),
     h("div.card", h("div.wrap", { style: { maxHeight: "calc(100vh - 290px)" } }, h("table",
-      h("thead", h("tr", h("th", "Type"), h("th", "Item"), h("th", "Description"), h("th", "Subcategory"), h("th.num", "Cost"), h("th.num", "Sell"), h("th", "Labor (H:M:S)"), h("th", "Vendor"))),
-      h("tbody", rows.length ? rows : h("tr", h("td", { colspan: 8 }, h("span.muted", CAT.q ? "Nothing matches that search." : "Nothing here yet."))))))),
+      h("thead", h("tr", h("th", "Type"), h("th", "Item"), h("th", "Part #"), h("th", "Description"), h("th", "Subcategory"), h("th.num", "Cost"), h("th.num", "Sell"), h("th", "Labor (H:M:S)"), h("th", "Vendor"))),
+      h("tbody", rows.length ? rows : h("tr", h("td", { colspan: 9 }, h("span.muted", CAT.q ? "Nothing matches that search." : "Nothing here yet."))))))),
     pages > 1 ? h("div.row", h("span.muted.small", `${d.total.toLocaleString()} items · page ${pg} of ${pages}`), h("span.grow"),
       h("button.btn.sm", { disabled: pg <= 1, onclick: () => { CAT.offset -= CAT.limit; renderCatalog(); } }, "Previous"),
       h("button.btn.sm", { disabled: pg >= pages, onclick: () => { CAT.offset += CAT.limit; renderCatalog(); } }, "Next")) : null);
