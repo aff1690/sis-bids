@@ -1,7 +1,7 @@
 // Helpers shared by both database drivers.
 
 export const TABLES = ["jobs", "plans", "sheets", "rooms", "zones", "devices", "catalog", "assemblies", "specs",
-  "equipment", "loads", "tape_runs", "code_findings", "usage"];
+  "equipment", "loads", "tape_runs", "code_findings", "usage", "homeruns", "circuits"];
 const T = TABLES.join("|");
 const KW = new RegExp(`\\b(FROM|INTO|UPDATE|JOIN|REFERENCES|ON|TABLE(?:\\s+IF\\s+NOT\\s+EXISTS)?)(\\s+)(${T})\\b(?!\\s*\\.)`, "g");
 const QUAL = new RegExp(`\\b(${T})\\.(?=[a-z_])`, "g");

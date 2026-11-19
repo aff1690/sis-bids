@@ -160,7 +160,7 @@ on("GET", "/jobs/:id", async ({ params }) => {
   if (!job) notFound();
   const id = job.id;
   const q = (sql) => db.prepare(sql).all(id);
-  const [plans, sheets, rooms, devices, zones, equipment, loads, findings, tape] = await Promise.all([
+  const [plans, sheets, rooms, devices, zones, equipment, loads, findings, tape, hrs, circuits] = await Promise.all([
     q("SELECT * FROM plans WHERE job_id = ? ORDER BY id"),
     q("SELECT * FROM sheets WHERE job_id = ? ORDER BY plan_id, page"),
     q("SELECT * FROM rooms WHERE job_id = ? ORDER BY level, number, name"),
@@ -170,12 +170,16 @@ on("GET", "/jobs/:id", async ({ params }) => {
     q("SELECT * FROM loads WHERE job_id = ? ORDER BY category, name"),
     q("SELECT * FROM code_findings WHERE job_id = ? ORDER BY sheet_id, status, id"),
     q("SELECT * FROM tape_runs WHERE job_id = ?"),
+    q("SELECT * FROM homeruns WHERE job_id = ?"),
+    q("SELECT * FROM circuits WHERE job_id = ? ORDER BY id"),
   ]);
   return {
     job: { ...job, settings: jobSettings(job) }, plans,
     sheets: sheets.map((s) => ({ ...s, analysis: s.analysis ? JSON.parse(s.analysis) : null })),
     rooms, devices, zones, equipment, loads, findings,
     tape_runs: tape.map((t) => ({ ...t, points: JSON.parse(t.points || "[]") })),
+    homeruns: hrs.map((r) => ({ ...r, points: JSON.parse(r.points || "[]") })),
+    circuits,
   };
 });
 
@@ -352,13 +356,28 @@ on("PATCH", "/devices/:id", async ({ req, params }) => {
     zoneId = null; // moved into another room: it leaves the old room's zone
   }
   const itemId = b.item_id !== undefined ? (Number(b.item_id) > 0 ? Math.floor(Number(b.item_id)) : null) : d.item_id ?? null;
-  await db.prepare("UPDATE devices SET type = ?, x = ?, y = ?, status = ?, note = ?, room_id = ?, zone_id = ?, item_id = ? WHERE id = ?")
-    .run(b.type ?? d.type, b.x ?? d.x, b.y ?? d.y, b.status ?? d.status, b.note ?? d.note, roomId, zoneId, itemId, d.id);
+  const circuitId = b.circuit_id !== undefined ? (Number(b.circuit_id) > 0 ? Math.floor(Number(b.circuit_id)) : null) : d.circuit_id ?? null;
+  await db.prepare("UPDATE devices SET type = ?, x = ?, y = ?, status = ?, note = ?, room_id = ?, zone_id = ?, item_id = ?, circuit_id = ? WHERE id = ?")
+    .run(b.type ?? d.type, b.x ?? d.x, b.y ?? d.y, b.status ?? d.status, b.note ?? d.note, roomId, zoneId, itemId, circuitId, d.id);
   if (zoneId && zone && !zone.room_id && roomId) { // a new zone takes the room of its first light
     await db.prepare("UPDATE zones SET room_id = ? WHERE id = ?").run(roomId, zoneId);
     await renumberZones(d.job_id);
   }
   return db.prepare("SELECT * FROM devices WHERE id = ?").get(d.id);
+});
+// Attach a catalog product or package to Claude's counts of one device type (Tony, 2026-11-19): every device of that
+// type that Claude found, or that has no item yet, counts as that item in the bid. Markers placed from the catalog keep
+// theirs. item_id null goes back to the Settings default. all_sheets does the whole job instead of this sheet.
+on("POST", "/sheets/:id/attach-item", async ({ req, params }) => {
+  const sheet = await db.prepare("SELECT * FROM sheets WHERE id = ?").get(params.id);
+  if (!sheet) notFound();
+  const b = await readJson(req);
+  if (!TYPE_KEYS.includes(b.type)) fail(400, "Unknown device type");
+  const itemId = Number(b.item_id) > 0 ? Math.floor(Number(b.item_id)) : null;
+  const where = b.all_sheets ? "job_id = ?" : "sheet_id = ?";
+  const r = await db.prepare(`UPDATE devices SET item_id = ? WHERE ${where} AND type = ? AND (source = 'ai' OR item_id IS NULL OR item_id = ?)`)
+    .run(itemId, b.all_sheets ? sheet.job_id : sheet.id, b.type, Number(b.prev_item_id) > 0 ? Math.floor(Number(b.prev_item_id)) : -1);
+  return { ok: true, changed: r?.meta?.changes ?? r?.changes ?? null };
 });
 on("DELETE", "/devices/:id", async ({ params }) => { await db.prepare("DELETE FROM devices WHERE id = ?").run(params.id); return { ok: true }; });
 on("POST", "/sheets/:id/confirm-all", async ({ params }) => {
@@ -458,6 +477,51 @@ on("GET", "/jobs/:id/specs-summary", async ({ params }) => {
     system: await sizeSystem(job.id, s),
     assemblies: Object.fromEntries(Object.entries(asm).map(([k, v]) => [k, { source: source[k], lines: v.map((l) => ({ description: l.resolved.description, qty: l.qty, part_number: l.catalog?.part_number || "" })) }])),
   };
+});
+
+// ---------------------------------------------------------------- circuits built by hand (Tony, 2026-11-19)
+const CIRCUIT_CLS = ["power", "gfci", "lighting", "safety", "c240"];
+on("POST", "/jobs/:id/circuits", async ({ req, params }) => {
+  const b = await readJson(req);
+  const n = (await db.prepare("SELECT COUNT(*) AS n FROM circuits WHERE job_id = ?").get(params.id))?.n || 0;
+  const cls = CIRCUIT_CLS.includes(b.cls) ? b.cls : "power";
+  const r = await db.prepare("INSERT INTO circuits (job_id, sheet_id, name, cls) VALUES (?, ?, ?, ?) RETURNING *")
+    .get(params.id, b.sheet_id ?? null, String(b.name || `Circuit ${n + 1}`).slice(0, 80), cls);
+  const ids = (Array.isArray(b.device_ids) ? b.device_ids : []).map(Number).filter((x) => x > 0);
+  if (ids.length) await db.batch(ids.map((id) => db.prepare("UPDATE devices SET circuit_id = ? WHERE id = ? AND job_id = ?").bind(r.id, id, params.id)));
+  return r;
+});
+on("PATCH", "/circuits/:id", async ({ req, params }) => {
+  const c = await db.prepare("SELECT * FROM circuits WHERE id = ?").get(params.id);
+  if (!c) notFound();
+  const b = await readJson(req);
+  await db.prepare("UPDATE circuits SET name = ?, cls = ? WHERE id = ?").run(b.name != null ? String(b.name).slice(0, 80) : c.name, CIRCUIT_CLS.includes(b.cls) ? b.cls : c.cls, c.id);
+  return db.prepare("SELECT * FROM circuits WHERE id = ?").get(c.id);
+});
+on("DELETE", "/circuits/:id", async ({ params }) => {
+  const c = await db.prepare("SELECT * FROM circuits WHERE id = ?").get(params.id);
+  if (!c) return { ok: true };
+  await db.batch([
+    db.prepare("UPDATE devices SET circuit_id = NULL WHERE circuit_id = ?").bind(c.id),
+    db.prepare("DELETE FROM homeruns WHERE job_id = ? AND key = ?").bind(c.job_id, `c:${c.id}`),
+    db.prepare("DELETE FROM circuits WHERE id = ?").bind(c.id),
+  ]);
+  return { ok: true };
+});
+
+// ---------------------------------------------------------------- home runs (Tony, 2026-11-19)
+// The tool suggests each home run; the estimator drags its bends to the real route and confirms it.
+// The adjusted route's length replaces the estimate. reset:true goes back to the suggestion.
+on("PUT", "/jobs/:id/homeruns", async ({ req, params }) => {
+  const b = await readJson(req);
+  const key = String(b.key || "");
+  if (!/^[zc]:\d+$/.test(key)) fail(400, "Bad home run");
+  if (b.reset) { await db.prepare("DELETE FROM homeruns WHERE job_id = ? AND key = ?").run(params.id, key); return { ok: true }; }
+  const pts = (Array.isArray(b.points) ? b.points : []).slice(0, 40).map((p) => ({ x: Math.round(Number(p.x) * 10) / 10, y: Math.round(Number(p.y) * 10) / 10 })).filter((p) => isFinite(p.x) && isFinite(p.y));
+  await db.prepare(`INSERT INTO homeruns (job_id, key, sheet_id, points, confirmed) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (job_id, key) DO UPDATE SET sheet_id = excluded.sheet_id, points = excluded.points, confirmed = excluded.confirmed`)
+    .run(params.id, key, b.sheet_id ?? null, JSON.stringify(pts), b.confirmed ? 1 : 0);
+  return db.prepare("SELECT * FROM homeruns WHERE job_id = ? AND key = ?").get(params.id, key).then((r) => ({ ...r, points: JSON.parse(r.points || "[]") }));
 });
 
 // ---------------------------------------------------------------- zones

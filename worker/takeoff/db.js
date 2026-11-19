@@ -54,6 +54,26 @@ export const SCHEMA = [
   bx0 REAL, by0 REAL, bx1 REAL, by1 REAL, -- room outline (PDF points)
   auto_number INTEGER DEFAULT 0           -- number assigned by the tool
 )`,
+  // A home run the estimator adjusted and/or confirmed (Tony, 2026-11-19). key = "z:<zone id>" or "c:<circuit id>".
+  // points = the bends between the first device and the panel, in sheet pixels.
+  // Branch circuits the estimator builds by hand (Tony, 2026-11-19), like zones: devices.circuit_id points here.
+  `CREATE TABLE IF NOT EXISTS circuits (
+  id INTEGER PRIMARY KEY,
+  job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  sheet_id INTEGER,
+  name TEXT DEFAULT '',
+  cls TEXT DEFAULT 'power',               -- power | gfci | lighting | safety | c240
+  note TEXT DEFAULT ''
+)`,
+  `CREATE TABLE IF NOT EXISTS homeruns (
+  id INTEGER PRIMARY KEY,
+  job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
+  sheet_id INTEGER,
+  points TEXT DEFAULT '[]',
+  confirmed INTEGER DEFAULT 0,
+  UNIQUE (job_id, key)
+)`,
   `CREATE TABLE IF NOT EXISTS zones (
   id INTEGER PRIMARY KEY,
   job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -188,6 +208,7 @@ export const SCHEMA = [
 
 /** Columns added after a table first shipped: [table, column, definition]. */
 const MIGRATIONS = [
+  ["devices", "circuit_id", "INTEGER"],
   ["devices", "zone_id", "INTEGER REFERENCES zones(id) ON DELETE SET NULL"],
   ["zones", "code", "TEXT DEFAULT ''"],
   ["plans", "doc_type", "TEXT DEFAULT 'plans'"],

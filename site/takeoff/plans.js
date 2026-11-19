@@ -89,7 +89,7 @@ function trackDevicePatches(ctx) {
     return orig(id, body);
   };
 }
-const devicePayload = (d) => ({ item_id: d.item_id ?? null, type: d.type, sheet_id: d.sheet_id, x: d.x, y: d.y, room_id: d.room_id, zone_id: d.zone_id, status: d.status, source: d.source, confidence: d.confidence, note: d.note });
+const devicePayload = (d) => ({ item_id: d.item_id ?? null, circuit_id: d.circuit_id ?? null, type: d.type, sheet_id: d.sheet_id, x: d.x, y: d.y, room_id: d.room_id, zone_id: d.zone_id, status: d.status, source: d.source, confidence: d.confidence, note: d.note });
 // ---- SIS Bids catalog on the plans (Tony, 2026-11-19): pick a product or package from the bid catalog and click (or drag it)
 // onto the drawing. The marker counts as that exact item in the bid; its device type still drives circuits, zoning and layers.
 const CAT = { q: "", kind: "", items: [], cats: [], favs: [], favOpen: true, open: new Set(), byCat: {}, cache: new Map(), typeFor: {}, loaded: false };
@@ -196,9 +196,51 @@ function buildCatalogPanel(sheet, devices, types, ctx) {
       h("select", { style: { width: "100%" }, onchange: (e) => { ui.placeItem.type = CAT.typeFor[ui.placeItem.id] = e.target.value; } },
         types.map((x) => h("option", { value: x.key, selected: x.key === ui.placeItem.type }, x.label)))) : null,
     list,
+    countsAttach(sheet, devices, types, ctx),
     Object.keys(byItem).length ? [h("h4", { style: { margin: "10px 0 4px", fontSize: ".8rem" } }, "From the catalog on this sheet"),
       Object.entries(byItem).map(([id, n]) => h("div.typecount", h("span", itemName(CAT.cache.get(Number(id))) || `Item ${id}`), h("strong", n)))] : null);
 }
+// Claude's counts on this sheet by device type, each with the product or package it counts as in the bid (Tony, 2026-11-19)
+function countsAttach(sheet, devices, types, ctx) {
+  const label = Object.fromEntries(types.map((t) => [t.key, t.label]));
+  const byType = new Map();
+  for (const d of devices) if (d.source === "ai" || !d.item_id) (byType.get(d.type) || byType.set(d.type, []).get(d.type)).push(d);
+  if (!byType.size) return null;
+  const rows = [...byType.entries()].sort((a, b) => b[1].length - a[1].length).map(([type, ds]) => {
+    const ids = [...new Set(ds.map((d) => d.item_id || 0))], one = ids.length === 1 ? ids[0] : null;
+    if (one && !CAT.cache.has(one)) itemInfo(one).then(() => ctx.rerender());
+    const cur = one ? itemName(CAT.cache.get(one)) || `Item ${one}` : one === 0 ? null : "Mixed";
+    const open = ui.attachType === type;
+    const attach = async (itemId) => {
+      try {
+        await api(`/api/sheets/${sheet.id}/attach-item`, { json: { type, item_id: itemId, prev_item_id: one || null, all_sheets: !!ui.attachAll } });
+        ui.attachType = null; await ctx.reload();
+      } catch (e) { toast(e.message, true); }
+    };
+    let picker = null;
+    if (open) {
+      const q = h("input", { type: "search", placeholder: "Search products and packages…", style: { width: "100%" } }), drop = h("div.catlist");
+      const fill = (items) => drop.replaceChildren(...(items.length ? items.map((it) => h("div.catrow", { onclick: () => attach(it.id) },
+        it.fav ? h("span.star.on", "★") : null, h("span.kpill." + it.kind, KIND_LABEL[it.kind] || it.kind), h("span.grow", h("b", itemName(it)), it.part_number ? h("span.muted", { style: { fontSize: ".75rem" } }, `  #${it.part_number}`) : null))) : [h("p.muted", "Nothing matches.")]));
+      fill(CAT.favs || []);
+      let t; q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(async () => {
+        if (!q.value.trim()) return fill(CAT.favs || []);
+        const r = await bidApi(`/api/catalog?q=${encodeURIComponent(q.value)}&limit=20`).catch(() => ({ items: [] }));
+        for (const it of r.items) CAT.cache.set(it.id, it); fill(r.items); }, 250); });
+      setTimeout(() => q.focus(), 0);
+      picker = h("div.attachpick", q,
+        h("label.muted", { style: { fontSize: ".75rem", display: "block", margin: "4px 0" } },
+          h("input", { type: "checkbox", checked: !!ui.attachAll, onchange: (e) => { ui.attachAll = e.target.checked; } }), " Every sheet in this job"),
+        drop, one ? h("button.small", { style: { marginTop: "4px" }, onclick: () => attach(null) }, "Back to the Settings default") : null);
+    }
+    return [h("div.attachrow" + (open ? ".open" : ""), { onclick: () => { ui.attachType = open ? null : type; ctx.rerender(); }, title: "Pick the product or package these count as in the bid" },
+      h("span.grow", h("b", label[type] || type), h("div.muted", { style: { fontSize: ".75rem" } }, cur ? "→ " + cur : "→ Settings default")),
+      h("strong", ds.length)), picker];
+  });
+  return [h("h4", { style: { margin: "10px 0 4px", fontSize: ".8rem" } }, "Claude's counts on this sheet"),
+    h("p.muted", { style: { fontSize: ".72rem", margin: "0 0 4px" } }, "Click a type to pick the product or package it counts as in the bid."), ...rows];
+}
+
 // the selected marker's catalog item: search to set it, or clear it so the device type's default from Settings is used
 function itemPicker(sel, ctx) {
   const cur = sel.item_id ? CAT.cache.get(sel.item_id) : null;
@@ -272,6 +314,14 @@ function snapOrtho(prev, p) {
   return Math.abs(p.x - prev.x) >= Math.abs(p.y - prev.y) ? { x: p.x, y: prev.y } : { x: prev.x, y: p.y };
 }
 const SVGNS = "http://www.w3.org/2000/svg";
+/** Save a home run's bends (confirmed stays as it was unless given); the system re-measures it. */
+let hrCtx = null;
+async function saveHr(info, bends, confirmed = info.confirmed, reset = false) {
+  try {
+    await api(`/api/jobs/${hrCtx.data.job.id}/homeruns`, { method: "PUT", json: reset ? { key: info.key, reset: true } : { key: info.key, sheet_id: info.sheet_id, points: bends, confirmed: !!confirmed } });
+    await hrCtx.reload();
+  } catch (e) { toast(e.message, true); }
+}
 const svgEl = (tag, attrs) => { const e = document.createElementNS(SVGNS, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); return e; };
 
 const EQUIP_LABEL = { elec_panel: "Electrical panel", dpm_panel: "Lighting panel (PD8)", riser: "Riser / chase to another floor", backup: "Backup unit (Powerwall / generator)" };
@@ -449,7 +499,7 @@ export function renderPlans(root, ctx) {
 // title bar, resized from the corner, and keep their position / size / open state between visits.
 const TOOL_WINDOWS = [
   ["catalog & packages", "Catalog & packages"], ["panels & risers", "Panels & risers"], ["claude analysis", "Claude analysis"], ["code check", "Code check"],
-  ["led tape", "LED tape"], ["lighting zones", "Lighting zones"], ["on this sheet", "On this sheet"],
+  ["led tape", "LED tape"], ["lighting zones", "Lighting zones"], ["circuits", "Circuits"], ["on this sheet", "On this sheet"],
   ["add devices by hand", "Add devices by hand"], ["sheet info", "Sheet info"],
 ];
 ui.win = (() => { try { return JSON.parse(localStorage.getItem("takeoff.windows") || "{}"); } catch { return {}; } })();
@@ -459,7 +509,7 @@ const toolScroll = {};
 const saveWin = () => { try { localStorage.setItem("takeoff.windows", JSON.stringify(ui.win)); } catch { /* storage blocked */ } };
 function winState(key, i) {
   if (!ui.win[key]) ui.win[key] = key === "catalog & packages" ? { open: true, x: 10, y: 170, w: 340, h: 520 }
-    : { open: key === "claude analysis", x: Math.max(10, innerWidth - 360 - i * 24), y: 110 + i * 28, w: 340, h: 440 };
+    : { open: key === "claude analysis" || key === "circuits", x: Math.max(10, innerWidth - 360 - i * 24), y: 110 + i * 28, w: 340, h: 440 };
   return ui.win[key];
 }
 
@@ -665,6 +715,7 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
     ui.placeType ? h("span.badge.pending", `Placing: ${typeMap[ui.placeType].label} — click the plan (Esc to stop)`) : null,
     ui.placeEquip ? h("span.badge.pending", `Placing: ${EQUIP_LABEL[ui.placeEquip]} — click the plan (Esc to stop)`) : null,
     ui.drawTape ? h("span.badge.pending", "LED tape: click each corner (runs snap to right angles) · double-click or Enter to finish · Backspace undoes a point · Esc cancels") : null,
+    ui.activeCircuit ? h("span.badge.pending", `Circuiting: click devices to add/remove from “${(data.circuits || []).find((c) => c.id === ui.activeCircuit)?.name || ""}” (Esc to stop)`) : null,
     ui.activeZone ? h("span.badge.pending", `Zoning: click lights to add/remove from “${(data.zones || []).find((z) => z.id === ui.activeZone)?.code || ""}” (Esc to stop)`) : null,
     h("div", { style: { position: "relative" } },
       h("button.small.layers-btn" + (ui.layersOpen ? ".primary" : ""), { onclick: () => { ui.layersOpen = !ui.layersOpen; layerPanel.hidden = !ui.layersOpen; } }, "Layers ▾"),
@@ -736,7 +787,8 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
         else if (d.zone_id && zc.has(d.zone_id)) { bg = zc.get(d.zone_id); if (ui.activeZone && d.zone_id !== ui.activeZone) opacity = 0.45; }
         else { bg = "#9ca3af"; label = "?"; }
       }
-      const m = h("div.marker" + (d.status === "pending" ? ".pending" : "") + (d.source === "code" ? ".code" : "") + (d.item_id ? ".itm" : "") + (d.id === ui.selected ? ".selected" : ""), {
+      if (ui.activeCircuit) { if (d.circuit_id === ui.activeCircuit) bg = "#1d4ed8"; else if (d.circuit_id) opacity = 0.35; }
+      const m = h("div.marker" + (d.status === "pending" ? ".pending" : "") + (d.source === "code" ? ".code" : "") + (d.item_id ? ".itm" : "") + (d.id === ui.selected ? ".selected" : "") + (ui.activeCircuit && d.circuit_id === ui.activeCircuit ? ".incirc" : ""), {
         style: { left: `${d.x * z}px`, top: `${d.y * z}px`, background: bg, ...(opacity != null ? { opacity } : {}) },
         title: `${d.item_id && CAT.cache.get(d.item_id) ? itemName(CAT.cache.get(d.item_id)) + " · " : ""}${t.label}${d.zone_id ? " · zone: " + (zoneName.get(d.zone_id) || "") : ""}${d.note ? " — " + d.note : ""}${d.confidence != null ? ` (${Math.round(d.confidence * 100)}%)` : ""}`,
       }, label);
@@ -827,6 +879,7 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
   /** SVG layer with zone wiring and circuits: device-to-device runs plus a dashed home run to the panel. */
   function drawWiring(z) {
     const dr = ctx.system?.drawing;
+    hrCtx = ctx;
     if (!dr) return null;
     const svg = svgEl("svg", { class: "wiring", width: sheet.width * z, height: sheet.height * z });
     const byId = new Map(devices.map((d) => [d.id, d]));
@@ -840,7 +893,7 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
      * One zone or circuit: the device-to-device run sits on its system layer (chainLayer), the dashed
      * home run to the panel on that system's HR layer (hrLayer). Labels follow whichever part is visible.
      */
-    const drawRun = (pts, end, color, name, hrFt, order, chainLayer, hrLayer, isCircuit = false) => {
+    const drawRun = (pts, end, color, name, hrFt, order, chainLayer, hrLayer, isCircuit = false, hrInfo = null) => {
       const showChain = chainLayer && ui.layers[chainLayer], showHr = hrLayer && ui.layers[hrLayer] && end;
       if (!showChain && !showHr) return;
       const cur = new Map(devices.map((d) => [d.id, d]));
@@ -852,11 +905,43 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
       if (showChain && ordered.length > 1) svg.append(svgEl("path", { d: ortho(ordered), fill: "none", stroke: color, "stroke-width": isCircuit ? 1.3 : 1.8, "stroke-linejoin": "miter", opacity: 0.9, ...(isCircuit ? { "stroke-dasharray": "1.5 3.5", "stroke-linecap": "round" } : {}) }));
       const start = ordered[0];
       if (showHr) {
-        // Home run drawn as an L (across, then down) the way it is routed, dashed, with a dot at the panel.
-        svg.append(svgEl("polyline", { points: `${P(start)} ${P({ x: end.x, y: start.y })} ${P(end)}`, fill: "none", stroke: color, "stroke-width": 1.8, "stroke-dasharray": "6 4", opacity: 0.85 }));
+        // Home run: a suggested route (dashed) the estimator can drag into place and confirm (solid) (Tony, 2026-11-19).
+        // Click it to select; drag the round handles to move a bend, the small square ones to add a bend.
+        const bends = hrInfo?.bends || [{ x: end.x, y: start.y }];
+        const path = [start, ...bends, end];
+        const sel = hrInfo && ui.selHr === hrInfo.key;
+        const confirmed = !!hrInfo?.confirmed;
+        svg.append(svgEl("polyline", { points: path.map(P).join(" "), fill: "none", stroke: color, "stroke-width": sel ? 3 : 1.8, ...(confirmed ? {} : { "stroke-dasharray": "6 4" }), opacity: 0.9 }));
         svg.append(svgEl("circle", { cx: end.x * z, cy: end.y * z, r: 3, fill: color }));
+        if (hrInfo) {
+          const hit = svgEl("polyline", { points: path.map(P).join(" "), fill: "none", stroke: "transparent", "stroke-width": 12, class: "hrhit" });
+          hit.addEventListener("pointerdown", (e) => { e.stopPropagation(); });
+          hit.addEventListener("click", (e) => { e.stopPropagation(); ui.selHr = sel ? null : hrInfo.key; ui.selHrInfo = { ...hrInfo, ft: hrFt, name }; ui.selected = null; ctx.rerender(); });
+          svg.append(hit);
+          if (sel) {
+            const save = (pts) => saveHr(hrInfo, pts, hrInfo.confirmed);
+            const dragHandle = (el, onMove, onUp) => el.addEventListener("pointerdown", (e) => {
+              e.stopPropagation(); e.preventDefault(); el.setPointerCapture(e.pointerId);
+              const rect = svg.getBoundingClientRect(), at = (ev) => ({ x: (ev.clientX - rect.left) / z, y: (ev.clientY - rect.top) / z });
+              const mv = (ev) => onMove(at(ev)), up = (ev) => { el.removeEventListener("pointermove", mv); el.removeEventListener("pointerup", up); onUp(at(ev)); };
+              el.addEventListener("pointermove", mv); el.addEventListener("pointerup", up);
+            });
+            bends.forEach((b, i) => {
+              const c = svgEl("circle", { cx: b.x * z, cy: b.y * z, r: 6, fill: "#fff", stroke: color, "stroke-width": 2, class: "hrhandle" });
+              c.addEventListener("dblclick", (e) => { e.stopPropagation(); save(bends.filter((_, j) => j !== i)); });
+              dragHandle(c, (p) => { c.setAttribute("cx", p.x * z); c.setAttribute("cy", p.y * z); }, (p) => save(bends.map((x, j) => (j === i ? p : x))));
+              svg.append(c);
+            });
+            for (let i = 0; i < path.length - 1; i++) {
+              const m = { x: (path[i].x + path[i + 1].x) / 2, y: (path[i].y + path[i + 1].y) / 2 };
+              const sq = svgEl("rect", { x: m.x * z - 4, y: m.y * z - 4, width: 8, height: 8, fill: color, opacity: 0.7, class: "hrhandle" });
+              dragHandle(sq, (p) => { sq.setAttribute("x", p.x * z - 4); sq.setAttribute("y", p.y * z - 4); }, (p) => { const nb = [...bends]; nb.splice(i, 0, p); save(nb); });
+              svg.append(sq);
+            }
+          }
+        }
       }
-      const label = showHr ? `${name} · HR ${hrFt}'` : name;
+      const label = showHr ? `${name} · HR ${hrFt}'${hrInfo && !hrInfo.confirmed ? " (suggested)" : ""}` : name;
       if (!label) return;
       const lx = showHr ? (start.x + end.x) / 2 : start.x, ly = start.y;
       const t = svgEl("text", { x: lx * z, y: ly * z - 4, fill: color, "font-size": 11, "font-weight": 700, "text-anchor": "middle", "paint-order": "stroke", stroke: "#fff", "stroke-width": 3 });
@@ -870,15 +955,18 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
       const zn = zoneById.get(zr.zone_id);
       const pts = devices.filter((d) => d.zone_id === zr.zone_id);
       const cat = groupCategory(pts.map((d) => d.type), tapeZones.has(zr.zone_id));
-      drawRun(pts, zr.end, zc.get(zr.zone_id) || "#555", zn?.code || "", zr.ft, zr.order, cat, `hr_${cat}`);
+      drawRun(pts, zr.end, zc.get(zr.zone_id) || "#555", zn?.code || "", zr.ft, zr.order, cat, `hr_${cat}`, false,
+        zr.key && zr.end ? { key: zr.key, bends: zr.bends, confirmed: zr.confirmed, sheet_id: sheet.id, suggested_ft: zr.suggested_ft } : null);
     }
     // Circuits: power / life safety by class; lighting and Ketra/DALI circuits by their fixtures; HR-only for feeds.
-    for (const c of dr.circuits.filter((x) => x.sheet_id === sheet.id)) {
+    for (const c of dr.circuits.filter((x) => x.sheet_id === sheet.id && !x.hidden)) {
       const pts = [...(c.device_ids || []).map((id) => byId.get(id)), ...(c.points || [])];
       const types = (c.device_ids || []).map((id) => byId.get(id)?.type).filter(Boolean);
       const cat = { power: "power", gfci: "power", c240: "power", safety: "life_safety" }[c.cls] || (c.cls === "lighting" || c.cls === "pd8" ? groupCategory(types, false) : null);
       const hr = { feeder: "hr_pd8", dedicated: "hr_equipment", backup: "hr_backup" }[c.cls] || (cat ? `hr_${cat}` : null);
-      drawRun(pts, c.end, CIRCUIT_COLOR[c.cls], `${c.cls === "lighting" ? "Circuit " : ""}${c.label}${c.cable ? ` ${c.cable}` : ""}`, c.ft, c.order, cat, hr, true);
+      // Only circuits built by hand are drawn (Tony, 2026-11-19); the tool's estimated circuits come back hidden.
+      drawRun(pts, c.end, CIRCUIT_COLOR[c.cls], `${c.name ? c.name + " · " : ""}${c.label}${c.cable ? ` ${c.cable}` : ""}`, c.ft, c.order, c.key ? cat : null, hr, true,
+        c.key && c.end ? { key: c.key, bends: c.bends, confirmed: c.confirmed, sheet_id: sheet.id, suggested_ft: c.suggested_ft } : null);
     }
     return svg.childNodes.length ? svg : null;
   }
@@ -923,6 +1011,10 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
         if (moved) {
           const nx = d.x + (ev.clientX - start.x) / ui.zoom, ny = d.y + (ev.clientY - start.y) / ui.zoom;
           await ctx.patchDevice(d.id, { x: nx, y: ny });
+        } else if (ui.activeCircuit) {
+          // circuiting: toggle this device on/off the active circuit
+          await ctx.patchDevice(d.id, { circuit_id: d.circuit_id === ui.activeCircuit ? null : ui.activeCircuit });
+          return;
         } else if (ui.activeZone && ctx.meta.fixture_types.includes(d.type)) {
           // zoning: toggle this light in/out of the active zone
           await ctx.patchDevice(d.id, { zone_id: d.zone_id === ui.activeZone ? null : ui.activeZone });
@@ -938,7 +1030,7 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
   let pan = null, justPanned = false;
   viewer.addEventListener("pointerdown", (e) => {
     if (e.button !== 0 && e.button !== 1) return;
-    if (e.button === 0 && e.target.closest(".marker, .equip")) return; // markers handle their own drag
+    if (e.button === 0 && e.target.closest(".marker, .equip, .hrhit, .hrhandle")) return; // markers and home-run handles handle their own drag
     // Stop the browser from starting its own image drag / text selection (the "no entry" cursor)
     // and, for the middle button, its autoscroll. Clicks still fire normally.
     e.preventDefault();
@@ -1163,7 +1255,10 @@ function buildInspector(sheet, devices, data, types, typeMap, roomsById, ctx) {
   out.push(buildTape(sheet, data, ctx));
 
   // --- zones ---
+  const hrPanel = buildHomeRunPanel(sheet, ctx);
+  if (hrPanel) out.unshift(hrPanel);
   out.push(buildZones(sheet, devices, data, ctx));
+  out.push(buildCircuits(sheet, devices, data, ctx));
 
   // --- counts on this sheet ---
   const counts = {};
@@ -1201,6 +1296,64 @@ function buildInspector(sheet, devices, data, types, typeMap, roomsById, ctx) {
 }
 
 // ======================================================================
+// The selected home run (Tony, 2026-11-19): suggested by the tool, dragged into place, then confirmed.
+function buildHomeRunPanel(sheet, ctx) {
+  if (!ui.selHr) return null;
+  const dr = ctx.system?.drawing;
+  const r = dr && [...dr.zones, ...dr.circuits].find((x) => x.key === ui.selHr);
+  if (!r) { ui.selHr = null; return null; }
+  const zn = r.zone_id ? (ctx.data.zones || []).find((z) => z.id === r.zone_id) : null;
+  const name = zn ? `Zone ${zn.code || zn.name}` : `${r.name || "Circuit"} ${r.label || ""}`;
+  const info = { key: r.key, bends: r.bends || [{ x: r.end.x, y: (r.order?.[0] || r.end).y }], confirmed: !!r.confirmed, sheet_id: r.sheet_id };
+  return h("div.section.hrpanel",
+    h("h4", { style: { margin: "0 0 4px" } }, "Home run: ", name),
+    h("p", { style: { margin: "2px 0 6px", fontSize: ".85rem" } }, h("b", `${r.ft} ft`), r.bends ? h("span.muted", ` (suggested ${r.suggested_ft} ft)`) : h("span.muted", " suggested"),
+      " · ", r.confirmed ? h("span", { style: { color: "#15803d", fontWeight: 700 } }, "Confirmed") : h("span", { style: { color: "var(--warn, #b45309)" } }, "Not confirmed")),
+    h("p.muted", { style: { fontSize: ".75rem", margin: "0 0 6px" } }, "Drag a round handle to move a bend, drag a small square to add one, double-click a round handle to remove it."),
+    h("div.row", { style: { gap: "4px" } },
+      h("button.small.primary", { onclick: () => saveHr(info, info.bends, !r.confirmed) }, r.confirmed ? "Unconfirm" : "✓ Confirm"),
+      r.bends ? h("button.small", { onclick: () => saveHr(info, null, false, true) }, "Back to suggestion") : null,
+      h("button.small", { onclick: () => { ui.selHr = null; ctx.rerender(); } }, "Done")));
+}
+
+// Branch circuits built by hand, like zones (Tony, 2026-11-19): make one, then click devices to add or remove them.
+const CIRCUIT_CLS_LABEL = { power: "Receptacles 20A", gfci: "GFCI 20A", lighting: "Lighting 15A", safety: "Smoke/CO", c240: "240V" };
+function buildCircuits(sheet, devices, data, ctx) {
+  const list = (data.circuits || []).filter((c) => c.sheet_id === sheet.id);
+  const counts = new Map(list.map((c) => [c.id, devices.filter((d) => d.circuit_id === c.id).length]));
+  const sys = new Map((ctx.system?.drawing?.circuits || []).filter((c) => c.circuit_id).map((c) => [c.circuit_id, c]));
+  const elecTypes = new Set(["receptacle", "receptacle_usb", "receptacle_afci", "receptacle_floor", "receptacle_ceiling", "receptacle_gfci", "receptacle_240", "smoke_co", ...ctx.meta.fixture_types]);
+  const off = devices.filter((d) => elecTypes.has(d.type) && !d.circuit_id && !d.zone_id).length;
+  const newCircuit = async (cls) => {
+    try {
+      const c = await api(`/api/jobs/${data.job.id}/circuits`, { json: { sheet_id: sheet.id, cls } });
+      (data.circuits ||= []).push(c);
+      ui.activeCircuit = c.id; ui.activeZone = null; ui.selected = null; ctx.rerender();
+    } catch (e) { toast(e.message, true); }
+  };
+  const patch = async (c, body) => { try { await api(`/api/circuits/${c.id}`, { method: "PATCH", json: body }); await ctx.reload(); } catch (e) { toast(e.message, true); } };
+  const sel = h("select", { style: { fontSize: ".8rem" } }, Object.entries(CIRCUIT_CLS_LABEL).map(([k, l]) => h("option", { value: k }, l)));
+  return h("div.section",
+    h("h3", `Circuits (${list.length})`),
+    off ? h("p.muted", { style: { fontSize: ".78rem" } }, `${off} device${off === 1 ? "" : "s"} on this sheet not on a circuit yet (lights in a zone are fed from the lighting panel).`) : null,
+    h("div.row", { style: { gap: "4px" } }, sel, h("button.primary", { onclick: () => newCircuit(sel.value) }, "+ New circuit")),
+    h("p.muted", { style: { fontSize: ".75rem" } }, "Click “Assign”, then click devices on the plan to add or remove them. Each circuit gets a suggested home run to adjust and confirm."),
+    list.map((c) => { const sc = sys.get(c.id); const color = CIRCUIT_COLOR[c.cls] || "#555";
+      return h("div", { style: { borderLeft: `4px solid ${color}`, padding: "4px 6px", marginBottom: "4px", background: c.id === ui.activeCircuit ? "#dbeafe" : "transparent", borderRadius: "4px" } },
+        h("div.row", { style: { gap: "4px" } },
+          h("strong", { style: { fontSize: ".8rem", color, minWidth: "48px" } }, sc?.label || "—"),
+          h("input", { value: c.name, style: { flex: 1, minWidth: "80px", fontSize: ".85rem" }, onchange: (e) => patch(c, { name: e.target.value }) }),
+          h("span.badge", `${counts.get(c.id)} dev`)),
+        h("div.row", { style: { gap: "4px", marginTop: "3px" } },
+          h("select", { style: { fontSize: ".8rem" }, onchange: (e) => patch(c, { cls: e.target.value }) }, Object.entries(CIRCUIT_CLS_LABEL).map(([k, l]) => h("option", { value: k, selected: c.cls === k }, l))),
+          sc ? h("button.small", { title: "Select its home run on the plan", onclick: () => { ui.selHr = sc.key; ctx.rerender(); } }, `HR ${sc.ft}'${sc.confirmed ? " ✓" : ""}`) : null,
+          h("button.small" + (c.id === ui.activeCircuit ? ".primary" : ""), { onclick: () => { ui.activeCircuit = ui.activeCircuit === c.id ? null : c.id; ui.activeZone = null; ui.selected = null; ctx.rerender(); } }, c.id === ui.activeCircuit ? "Done" : "Assign"),
+          h("button.small.danger", { title: "Delete circuit (its devices go back to not on a circuit)", onclick: async () => {
+            try { await api(`/api/circuits/${c.id}`, { method: "DELETE" }); if (ui.activeCircuit === c.id) ui.activeCircuit = null; await ctx.reload(); } catch (e) { toast(e.message, true); }
+          } }, "✕")));
+    }));
+}
+
 function buildZones(sheet, devices, data, ctx) {
   const zones = (data.zones || []).filter((z) => z.sheet_id === sheet.id)
     .sort((a, b) => (a.code || "").replace(/^[KD]/, "").localeCompare((b.code || "").replace(/^[KD]/, ""), undefined, { numeric: true }));
@@ -1259,7 +1412,7 @@ function buildZones(sheet, devices, data, ctx) {
           Object.entries(ZONE_CONTROL).map(([k, l]) => h("option", { value: k, selected: z.control === k }, l))),
         h("label", { style: { fontSize: ".75rem", whiteSpace: "nowrap" }, title: "Exterior lights on one wall face: one zone even across rooms" },
           h("input", { type: "checkbox", checked: !!z.exterior, onchange: (e) => patchZone(z, { exterior: e.target.checked }) }), " Exterior"),
-        h("button.small" + (z.id === ui.activeZone ? ".primary" : ""), { onclick: () => { ui.activeZone = ui.activeZone === z.id ? null : z.id; ui.zoneMode = true; ui.selected = null; ctx.rerender(); } }, z.id === ui.activeZone ? "Done" : "Assign"),
+        h("button.small" + (z.id === ui.activeZone ? ".primary" : ""), { onclick: () => { ui.activeZone = ui.activeZone === z.id ? null : z.id; ui.activeCircuit = null; ui.zoneMode = true; ui.selected = null; ctx.rerender(); } }, z.id === ui.activeZone ? "Done" : "Assign"),
         h("button.small.danger", { title: "Delete zone (lights become unzoned)", onclick: async () => {
           await api(`/api/zones/${z.id}`, { method: "DELETE" });
           if (ui.activeZone === z.id) ui.activeZone = null;
@@ -1283,14 +1436,9 @@ function buildZones(sheet, devices, data, ctx) {
 async function runAnalysis(sheet, data, ctx) {
   try {
     const res = await analyzeSheetInBrowser(sheet, (msg) => { ui.busy = msg; ctx.rerender(); });
-    let zoned = "";
-    if (ctx.lightingAutoZone && res.devices) { // Lutron spec: zone the lights in the same review (Tony, TO12)
-      ui.busy = "Claude is grouping the lights into zones…"; ctx.rerender();
-      const z = await api(`/api/sheets/${sheet.id}/auto-zone`, { method: "POST" }).catch((e) => ({ error: e.message }));
-      if (z.error) zoned = ` Zoning didn't run (${z.error}).`;
-      else { zoned = `, ${z.zones} lighting zones`; res.usage.cost_usd = +(res.usage.cost_usd + z.usage.cost_usd).toFixed(2); ui.zoneMode = true; }
-    }
-    toast(`Found ${res.rooms} rooms and ${res.devices} devices${zoned.startsWith(",") ? zoned : ""} (${money(res.usage.cost_usd)} API cost). Check the dashed markers.${zoned.startsWith(" ") ? zoned : ""}`);
+    // No automatic zoning after the analysis (Tony, 2026-11-19): the team zones by hand, it's faster than fixing Claude's zones.
+    // "Auto-zone with Claude" stays as a button for anyone who wants it.
+    toast(`Found ${res.rooms} rooms and ${res.devices} devices (${money(res.usage.cost_usd)} API cost). Check the dashed markers.`);
   } catch (e) {
     toast(e.message, true);
   }
@@ -1395,7 +1543,7 @@ export function handlePlanKeys(e, ctx) {
   }
   const isDelete = e.key === "Delete" || e.key === "Backspace";
   if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z")) { e.preventDefault(); undoLast(ctx); }
-  else if (e.key === "Escape") { ui.placeType = null; ui.placeItem = null; ui.placeEquip = null; ui.selected = null; ui.selectedEquip = null; ui.selectedTape = null; ui.activeZone = null; ctx.rerender(); }
+  else if (e.key === "Escape") { ui.placeType = null; ui.placeItem = null; ui.placeEquip = null; ui.selected = null; ui.selectedEquip = null; ui.selectedTape = null; ui.activeZone = null; ui.activeCircuit = null; ui.selHr = null; ctx.rerender(); }
   else if (isDelete && ui.selected) {
     // Delete removes whatever is selected; Ctrl+Z / Undo brings it back.
     e.preventDefault();

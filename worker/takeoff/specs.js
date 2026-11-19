@@ -655,8 +655,12 @@ export async function sizeSystem(jobId, settingsIn) {
   const js = jobSpecs(s);
   const rules = js.lighting?.data.rules || DEFAULT_RULES;
   const prules = js.panels?.data.rules || DEFAULT_RULES;
-  const devices = await db.prepare("SELECT id, type, zone_id, room_id, sheet_id, x, y FROM devices WHERE job_id = ?").all(jobId);
+  const devices = await db.prepare("SELECT id, type, zone_id, room_id, sheet_id, x, y, circuit_id FROM devices WHERE job_id = ?").all(jobId)
+    .catch(() => db.prepare("SELECT id, type, zone_id, room_id, sheet_id, x, y FROM devices WHERE job_id = ?").all(jobId));
+  const manualCircuits = await db.prepare("SELECT * FROM circuits WHERE job_id = ? ORDER BY id").all(jobId).catch(() => []);
   const zones = await db.prepare("SELECT * FROM zones WHERE job_id = ?").all(jobId);
+  // home runs the estimator adjusted or confirmed (Tony, 2026-11-19): their drawn route replaces the estimate
+  const hrSaved = new Map((await db.prepare("SELECT * FROM homeruns WHERE job_id = ?").all(jobId).catch(() => [])).map((r) => [r.key, { ...r, points: JSON.parse(r.points || "[]") }]));
   const equipment = await db.prepare("SELECT * FROM equipment WHERE job_id = ?").all(jobId);
   const sheets = Object.fromEntries((await db.prepare("SELECT id, sheet_no, page, kind, analysis FROM sheets WHERE job_id = ?").all(jobId))
     .map((sh) => [sh.id, { ...sh, analysis: sh.analysis ? JSON.parse(sh.analysis) : null }]));
@@ -707,6 +711,14 @@ export async function sizeSystem(jobId, settingsIn) {
     if (!hr) missing[kind].add(sheetName(sid));
     return { ft: hr ? hr.ft : Number(s.default_homerun_ft), panel: panelFor(hr?.origin, kind), origin: hr?.origin || null };
   };
+  /** A saved route for this home run: start (first device) → bends → panel, measured at right angles. */
+  const adjusted = (key, start, r, sid) => {
+    const sv = hrSaved.get(key);
+    if (!sv || !r.origin || !start || start.x == null) return { ft: r.ft, bends: null, confirmed: false };
+    const path = [start, ...sv.points, r.origin];
+    let px = 0; for (let i = 1; i < path.length; i++) px += md(path[i - 1], path[i]);
+    return { ft: px / ppfOf(sid) + Number(r.origin.extra_ft || 0) + Number(s.homerun_vertical_ft), bends: sv.points, confirmed: !!sv.confirmed };
+  };
   // Geometry for drawing zones and circuits on the sheets.
   const draw = { zones: [], circuits: [] };
   const endOf = (o) => (o && o.x != null ? { x: o.x, y: o.y } : null);
@@ -747,7 +759,9 @@ export async function sizeSystem(jobId, settingsIn) {
     zoneRuns.push({ zone_id: z.id, code: z.code, ft: Math.round(r.ft) });
     const sid = pts[0]?.sheet_id ?? z.sheet_id;
     const ch = chainFor(pts, r.origin, sid, "14/2");
-    draw.zones.push({ zone_id: z.id, sheet_id: sid, end: endOf(r.origin), ft: Math.round(r.ft), run_ft: Math.round(ch.ft), order: ch.order, panel: r.panel });
+    const hr = adjusted(`z:${z.id}`, ch.order[0], r, sid);
+    dpmHomeRunFt += hr.ft - r.ft;
+    draw.zones.push({ zone_id: z.id, key: `z:${z.id}`, sheet_id: sid, end: endOf(r.origin), ft: Math.round(hr.ft), suggested_ft: Math.round(r.ft), bends: hr.bends, confirmed: hr.confirmed, run_ft: Math.round(ch.ft), order: ch.order, panel: r.panel });
   }
   // DALI bus runs from the DALI module (in the DPM panel) to each DALI zone.
   let daliBusFt = 0;
@@ -757,8 +771,9 @@ export async function sizeSystem(jobId, settingsIn) {
     tally(r.panel, "dali_fixtures", pts.length);
     const sid = pts[0]?.sheet_id ?? z.sheet_id;
     const ch = chainFor(pts, r.origin, sid);
-    daliBusFt += r.ft;
-    draw.zones.push({ zone_id: z.id, sheet_id: sid, end: endOf(r.origin), ft: Math.round(r.ft), run_ft: Math.round(ch.ft), order: ch.order, panel: r.panel });
+    const hr = adjusted(`z:${z.id}`, ch.order[0], r, sid);
+    daliBusFt += hr.ft;
+    draw.zones.push({ zone_id: z.id, key: `z:${z.id}`, sheet_id: sid, end: endOf(r.origin), ft: Math.round(hr.ft), suggested_ft: Math.round(r.ft), bends: hr.bends, confirmed: hr.confirmed, run_ft: Math.round(ch.ft), order: ch.order, panel: r.panel });
   }
   for (const z of [...ketraZones, ...used.filter((u) => u.control === "wall")]) {
     const pts = zoneDevices.get(z.id);
@@ -777,7 +792,7 @@ export async function sizeSystem(jobId, settingsIn) {
       pd8Circuits++; pd8Ft += r.ft;
       tally(r.panel, "pd8_circuits");
       const ch = chainFor(c, r.origin, sid, "14/2");
-      draw.circuits.push({ cls: "pd8", name: "Ketra/DALI constant power", sheet_id: sid, device_ids: c.map((d) => d.id), order: ch.order, run_ft: Math.round(ch.ft), end: endOf(r.origin), ft: Math.round(r.ft), panel: r.panel });
+      draw.circuits.push({ cls: "pd8", hidden: true, name: "Ketra/DALI constant power", sheet_id: sid, device_ids: c.map((d) => d.id), order: ch.order, run_ft: Math.round(ch.ft), end: endOf(r.origin), ft: Math.round(r.ft), panel: r.panel });
     }
   }
   // PD8 count: enough module slots AND enough distribution spots.
@@ -817,8 +832,18 @@ export async function sizeSystem(jobId, settingsIn) {
   // Lighting loads fed from the PD8 (DPM zones, Ketra, DALI) are not electrical-panel circuits.
   const pd8Fed = new Set([...dpmZones, ...daliZones, ...ketraZones].map((z) => z.id));
   const circ = { power: [], gfci: [], lighting: [], c240: [], safety: [] };
+  // Circuits built by hand are drawn and measured. Devices not on one yet are still packed into estimated circuits
+  // so the counts hold up, but those aren't drawn (Tony, 2026-11-19: fixing auto circuits took longer than drawing them).
+  const onCircuit = new Map();
+  for (const d of devices) if (d.circuit_id) (onCircuit.get(d.circuit_id) || onCircuit.set(d.circuit_id, []).get(d.circuit_id)).push(d);
+  for (const mc of manualCircuits) {
+    const ds = onCircuit.get(mc.id) || []; if (!ds.length) continue;
+    const field = ["power", "gfci", "lighting", "safety", "c240"].includes(mc.cls) ? mc.cls : "power";
+    circ[field].push(Object.assign(ds, { name: mc.name || "", key: `c:${mc.id}`, circuit_id: mc.id, manual: true }));
+  }
+  const unassigned = devices.filter((d) => !d.circuit_id || !onCircuit.has(d.circuit_id) || !manualCircuits.some((m) => m.id === d.circuit_id));
   const bySheet = new Map();
-  for (const d of devices) (bySheet.get(d.sheet_id) || bySheet.set(d.sheet_id, []).get(d.sheet_id)).push(d);
+  for (const d of unassigned) (bySheet.get(d.sheet_id) || bySheet.set(d.sheet_id, []).get(d.sheet_id)).push(d);
   for (const [, devs] of bySheet) {
     circ.power.push(...packCircuits(devs.filter((d) => POWER_TYPES.includes(d.type)), prules.receptacles_per_circuit));
     const gf = devs.filter((d) => d.type === "receptacle_gfci");
@@ -845,9 +870,11 @@ export async function sizeSystem(jobId, settingsIn) {
     const cable = field === "c240" ? null : c.cable || CABLE[field]; // 240V circuits keep their assembly cable
     const ch = chainFor(c, r.origin, c[0].sheet_id, cable);
     if (js.panels) tally(r.panel, field);
+    const hr = c.manual ? adjusted(c.key, ch.order[0], r, c[0].sheet_id) : { ft: r.ft, bends: null, confirmed: false };
     draw.circuits.push({ cls, name: c.name || "", sheet_id: c[0].sheet_id, device_ids: c.filter((d) => d.id).map((d) => d.id),
-      order: ch.order, run_ft: Math.round(ch.ft), cable, end: endOf(r.origin), ft: Math.round(r.ft), panel: r.panel, poles: field === "c240" ? 2 : 1 });
-    return a + r.ft;
+      key: c.key || null, circuit_id: c.circuit_id || null, hidden: !c.manual, suggested_ft: Math.round(r.ft), bends: hr.bends, confirmed: hr.confirmed,
+      order: ch.order, run_ft: Math.round(ch.ft), cable, end: endOf(r.origin), ft: Math.round(hr.ft), panel: r.panel, poles: field === "c240" ? 2 : 1 });
+    return a + hr.ft;
   }, 0);
   // Device-to-device runs are always measured; home runs are only priced with a panel spec.
   const powerHr = runFt(circ.power, "power", "power") + runFt(circ.gfci, "gfci", "gfci");
@@ -923,6 +950,8 @@ export async function sizeSystem(jobId, settingsIn) {
 
   // ----- warnings -----
   const warnings = [];
+  const offCircuit = unassigned.filter((d) => POWER_TYPES.includes(d.type) || d.type === "receptacle_gfci" || d.type === "smoke_co" || (FIXTURE_TYPES.includes(d.type) && !pd8Fed.has(d.zone_id))).length;
+  if (js.panels && offCircuit) warnings.push(`${offCircuit} device(s) aren't on a circuit yet. They're counted with estimated circuits until you circuit them on the Plans tab.`);
   if (js.lighting && rules.zoning_required && unzoned) warnings.push(`${unzoned} light fixture(s) are not in a zone yet. The DPM and panel count only covers zoned lights. Zone them on the Plans tab.`);
   if (rfDevices.length && rfProcessors > Math.ceil(rfDevices.length / rules.rf_devices_per_processor)) warnings.push(`RF processors increased to ${rfProcessors} for the ${rules.rf_range_ft} ft range. Confirm processor locations on site; dense materials shorten range.`);
   for (const p of panelSchedule) {
