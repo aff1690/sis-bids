@@ -580,19 +580,22 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
   stage.append(canvas, overlay);
   viewer.append(stage);
 
-  const fitZoom = () => Math.max(0.1, (viewer.clientWidth - 40) / sheet.width);
-  const setZoom = (z, anchor) => {
-    const old = ui.zoom;
-    ui.zoom = Math.min(6, Math.max(0.1, z));
+  // Fit = the whole sheet in view (width and height), so big screens use their space (Tony, 2026-11-19)
+  const fitZoom = () => Math.max(0.1, Math.min((viewer.clientWidth - 40) / sheet.width, (viewer.clientHeight - 40) / sheet.height));
+  const setZoom = (z, anchor, fit = false) => {
+    const old = ui.zoom, ox = stage.offsetLeft, oy = stage.offsetTop;
+    ui.zoom = Math.min(6, Math.max(0.1, z)); ui.fitted = fit;
     layout();
     if (anchor && old) {
-      // keep the drawing point under the cursor fixed (16px = stage margin)
-      const r = ui.zoom / old, M = 16;
-      viewer.scrollLeft = (viewer.scrollLeft + anchor.x - M) * r + M - anchor.x;
-      viewer.scrollTop = (viewer.scrollTop + anchor.y - M) * r + M - anchor.y;
+      // keep the drawing point under the cursor fixed (the page is centred, so its offset changes with the zoom)
+      const r = ui.zoom / old;
+      viewer.scrollLeft = (viewer.scrollLeft + anchor.x - ox) * r + stage.offsetLeft - anchor.x;
+      viewer.scrollTop = (viewer.scrollTop + anchor.y - oy) * r + stage.offsetTop - anchor.y;
     }
     scheduleRender();
   };
+  // a fitted sheet stays fitted when the window is resized or maximised
+  if (window.ResizeObserver) { let rt; new ResizeObserver(() => { clearTimeout(rt); rt = setTimeout(() => { if (ui.fitted && viewer.isConnected && viewer.clientWidth) setZoom(fitZoom(), null, true); }, 150); }).observe(viewer); }
 
   const pending = devices.filter((d) => d.status === "pending");
   const groups = [...new Set(Object.values(LAYERS).map((v) => v.group))];
@@ -627,7 +630,7 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
     pending.length ? h("button.small", { onclick: () => nextPending(1) }, `Next to check (${pending.length})`) : null,
     h("button.small", { title: undoStack.length ? `Undo ${undoStack[undoStack.length - 1].label} (Ctrl+Z)` : "Nothing to undo", disabled: !undoStack.length, onclick: () => undoLast(ctx) }, `↶ Undo${undoStack.length ? ` (${undoStack.length})` : ""}`),
     h("button.small", { onclick: () => setZoom(ui.zoom / 1.25) }, "−"),
-    h("button.small", { onclick: () => { setZoom(fitZoom()); } }, "Fit"),
+    h("button.small", { onclick: () => { setZoom(fitZoom(), null, true); } }, "Fit"),
     h("button.small", { onclick: () => setZoom(ui.zoom * 1.25) }, "+"),
     buildToolsMenu(ctx),
   );
@@ -996,7 +999,7 @@ function buildViewer(sheet, devices, data, typeMap, ctx, picker) {
 
   // initial layout after mount
   requestAnimationFrame(() => {
-    if (!ui.zoom) ui.zoom = fitZoom();
+    if (!ui.zoom) { ui.zoom = fitZoom(); ui.fitted = true; }
     layout(); render();
     if (ui.scrollTo) {
       viewer.scrollLeft = ui.scrollTo.x * ui.zoom - viewer.clientWidth / 2;

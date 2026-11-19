@@ -128,12 +128,12 @@ tr.clickable:hover { background: var(--hover); cursor: pointer; }
 .badge.pending { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
 .center { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .toolbar { display: flex; gap: 6px; align-items: center; padding: 6px 10px; background: var(--surface); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
-.viewer { flex: 1; overflow: auto; position: relative; background: var(--canvas); cursor: grab; touch-action: none;
+.viewer { flex: 1; overflow: auto; position: relative; display: flex; flex-direction: column; padding: 16px; background: var(--canvas); cursor: grab; touch-action: none;
   user-select: none; -webkit-user-select: none; -webkit-user-drag: none; }
 .viewer * { -webkit-user-drag: none; user-select: none; }
 .viewer.panning, .viewer.panning * { cursor: grabbing !important; }
 .viewer .marker { cursor: pointer; }
-.stage { position: relative; margin: 16px; box-shadow: 0 1px 6px rgba(0,0,0,.25); background: #fff; transform-origin: 0 0; color: #1b2027; }
+.stage { position: relative; flex: none; margin: auto; box-shadow: 0 1px 6px rgba(0,0,0,.25); background: #fff; transform-origin: 0 0; color: #1b2027; }
 .stage canvas { display: block; }
 .overlay { position: absolute; inset: 0; }
 .overlay.placing { cursor: crosshair; }
