@@ -243,19 +243,36 @@ function countsAttach(sheet, devices, types, ctx) {
 
 // the selected marker's catalog item: search to set it, or clear it so the device type's default from Settings is used
 function itemPicker(sel, ctx) {
+  // Picking an item sets every device of this type (Tony, 2026-11-19): Claude's counts and any without an item, on this
+  // sheet or the whole job. "Only this one" sets just the selected marker.
   const cur = sel.item_id ? CAT.cache.get(sel.item_id) : null;
   if (sel.item_id && !CAT.cache.has(sel.item_id)) itemInfo(sel.item_id).then(() => ctx.rerender());
+  const typeLabel = ctx.types.find((t) => t.key === sel.type)?.label || "device";
+  const sameType = ctx.data.devices.filter((d) => d.sheet_id === sel.sheet_id && d.type === sel.type && (d.source === "ai" || !d.item_id || d.item_id === sel.item_id)).length;
+  ui.pickScope ||= "sheet";
+  const scope = h("select", { style: { width: "100%", margin: "2px 0 4px" }, onchange: (e) => { ui.pickScope = e.target.value; } },
+    [["sheet", `All ${sameType} ${typeLabel.toLowerCase()} on this sheet`], ["job", `All ${typeLabel.toLowerCase()} on every sheet`], ["one", "Only this one"]]
+      .map(([v, l]) => h("option", { value: v, selected: ui.pickScope === v }, l)));
+  const apply = async (itemId) => {
+    if (ui.pickScope === "one") return ctx.patchDevice(sel.id, itemId ? { item_id: itemId, status: "confirmed" } : { item_id: null });
+    try {
+      await api(`/api/sheets/${sel.sheet_id}/attach-item`, { json: { type: sel.type, item_id: itemId, prev_item_id: sel.item_id || null, all_sheets: ui.pickScope === "job" } });
+      await ctx.reload();
+    } catch (e) { toast(e.message, true); }
+  };
   const q = h("input", { type: "search", placeholder: cur ? "Change…" : "Search the catalog…", style: { width: "100%" } }), drop = h("div.catlist", { hidden: true });
+  const show = (items) => { drop.replaceChildren(...(items.length ? items.map((it) => h("div.catrow", { onclick: () => apply(it.id) },
+      it.fav ? h("span.star.on", "★") : null, h("span.kpill." + it.kind, KIND_LABEL[it.kind] || it.kind), h("b.grow", itemName(it)))) : [h("p.muted", "Nothing matches.")])); drop.hidden = false; };
+  q.addEventListener("focus", () => { if (!q.value.trim() && CAT.favs?.length) show(CAT.favs); });
   let t; q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(async () => {
-    if (!q.value.trim()) { drop.hidden = true; return; }
+    if (!q.value.trim()) { if (CAT.favs?.length) show(CAT.favs); else drop.hidden = true; return; }
     const r = await bidApi(`/api/catalog?q=${encodeURIComponent(q.value)}&limit=12`).catch(() => ({ items: [] }));
     for (const it of r.items) CAT.cache.set(it.id, it);
-    drop.replaceChildren(...(r.items.length ? r.items.map((it) => h("div.catrow", { onclick: () => ctx.patchDevice(sel.id, { item_id: it.id, status: "confirmed" }) },
-      h("span.kpill." + it.kind, KIND_LABEL[it.kind] || it.kind), h("b.grow", itemName(it)))) : [h("p.muted", "Nothing matches.")]));
-    drop.hidden = false; }, 250); });
+    show(r.items); }, 250); });
   return [h("label.muted", { style: { fontSize: ".8rem" } }, "Catalog item in the bid"),
     h("div.row", { style: { gap: "6px", margin: "2px 0 4px" } }, cur ? h("span.grow", h("span.kpill." + cur.kind, KIND_LABEL[cur.kind]), " ", itemName(cur)) : h("span.grow.muted", "The default for this device type (Settings)"),
-      sel.item_id ? h("button.small", { onclick: () => ctx.patchDevice(sel.id, { item_id: null }) }, "Clear") : null),
+      sel.item_id ? h("button.small", { onclick: () => apply(null) }, "Clear") : null),
+    h("label.muted", { style: { fontSize: ".75rem" } }, "Apply to"), scope,
     q, drop];
 }
 
