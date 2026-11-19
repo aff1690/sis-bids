@@ -430,6 +430,43 @@ function favStar(it, after) {
   return b;
 }
 
+// searchable pick-list: type to filter, click to choose; only values on the list are kept.
+// opts.add(name) (Admins) adds a new value to Settings from right here.
+function combo(value, options, opts = {}) {
+  const input = h("input", { value, placeholder: opts.placeholder || "", autocomplete: "off" }), list = h("div.list", { hidden: true });
+  let last = value, hi = -1, shown = [];
+  const pick = v => { input.value = v; last = v; list.hidden = true; opts.onPick && opts.onPick(v); };
+  const draw = () => {
+    const q = input.value.trim().toLowerCase(), all = options();
+    shown = (q && !all.some(x => x.toLowerCase() === q) ? all.filter(x => x.toLowerCase().includes(q)) : all).slice(0, 200);
+    const exact = all.some(x => x.toLowerCase() === q);
+    const rows = shown.map((x, i) => h("div" + (i === hi ? ".hi" : ""), { onmousedown: e => { e.preventDefault(); pick(x); } }, x));
+    if (q && !exact && opts.add && ME.settings) rows.push(h("div", { style: { color: "var(--gold)", fontWeight: 600 }, onmousedown: async e => { e.preventDefault();
+      const name = input.value.trim(); try { await opts.add(name); pick(name); toast(`Added "${name}" to Settings.`); } catch (err) { toast(err.message, true); } } }, `+ Add “${input.value.trim()}” to Settings`));
+    if (!rows.length) rows.push(h("div.muted", { style: { cursor: "default" } }, all.length ? "No matches" : (opts.empty ? opts.empty() : "Nothing in Settings yet.")));
+    fill(list, rows); list.hidden = false;
+  };
+  input.addEventListener("focus", () => { hi = -1; draw(); });
+  input.addEventListener("input", () => { hi = -1; draw(); });
+  input.addEventListener("keydown", e => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); hi = Math.max(0, Math.min(shown.length - 1, hi + (e.key === "ArrowDown" ? 1 : -1))); draw(); }
+    else if (e.key === "Enter" && !list.hidden) { e.preventDefault(); if (shown[hi] != null) pick(shown[hi]); else if (shown.length === 1) pick(shown[0]); }
+    else if (e.key === "Escape" && !list.hidden) { e.stopPropagation(); list.hidden = true; }
+  });
+  input.addEventListener("blur", () => setTimeout(() => {
+    list.hidden = true;
+    const v = input.value.trim(); if (!v) { if (last !== "") { last = ""; opts.onPick && opts.onPick(""); } return; }
+    const m = options().find(x => x.toLowerCase() === v.toLowerCase());
+    if (m) { if (m !== last) pick(m); else input.value = m; }
+    else { input.value = last; toast(`"${v}" isn't a ${opts.what || "choice"} in Settings. Pick one from the list${ME.settings ? " or add it" : ""}.`, true); }
+  }, 120));
+  return { input, wrap: h("div.picker", input, list) };
+}
+async function saveCats(change) {
+  const list = JSON.parse(JSON.stringify(SET.categories || [])); change(list);
+  const r = await api("/api/settings/categories", { method: "PUT", json: { categories: list } }); SET.categories = r.categories;
+}
+
 // labor lines editor: [{cost_code, seconds}]
 function laborEditor(lines, onChange) {
   const box = h("div");
@@ -503,6 +540,15 @@ async function editItem(id, kind) {
   const it = id ? (await api(`/api/catalog/${id}`)).item : { kind, manufacturer: "", model: "", labor: [], items: [], taxable: kind === "product", unit_price: kind === "labor" ? null : 0, unit_cost: 0, order_units: 1, extra: {} };
   kind = it.kind;
   const f = {}, inp = (k, attrs = {}) => (f[k] = h("input", { value: it[k] ?? "", ...attrs }));
+  // category and subcategory come from the lists in Settings (Tony, 2026-11-19)
+  const catList = () => (SET.categories || []).map(c => c.name);
+  const subList = () => { const c = (SET.categories || []).find(x => x.name.toLowerCase() === f.category.value.trim().toLowerCase()); return c ? c.subs : []; };
+  const catCombo = combo(it.category || "", catList, { placeholder: "Pick a category", what: "category", onPick: () => { if (!subList().some(x => x.toLowerCase() === f.subcategory.value.trim().toLowerCase())) f.subcategory.value = ""; },
+    add: name => saveCats(list => { if (!list.some(c => c.name.toLowerCase() === name.toLowerCase())) list.push({ name, subs: [] }); }) });
+  f.category = catCombo.input;
+  const subCombo = combo(it.subcategory || "", subList, { placeholder: "Pick a subcategory", what: "subcategory", empty: () => f.category.value.trim() ? "No subcategories for this category in Settings." : "Pick a category first.",
+    add: name => { const cat = f.category.value.trim(); if (!cat) throw new Error("Pick a category first."); return saveCats(list => { let c = list.find(x => x.name.toLowerCase() === cat.toLowerCase()); if (!c) list.push(c = { name: cat, subs: [] }); if (!c.subs.some(x => x.toLowerCase() === name.toLowerCase())) c.subs.push(name); }); } });
+  f.subcategory = subCombo.input;
   const labor = (it.labor || []).map(l => ({ ...l })), items = (it.items || []).map(x => ({ ...x }));
   if (kind === "labor" && !labor.length) labor.push({ cost_code: "", seconds: 3600 });
   const sysOpts = [];
@@ -530,8 +576,8 @@ async function editItem(id, kind) {
           field(nameLabel, inp("model", { required: true }), kind === "product" ? "" : "span2"),
           kind === "product" ? field("Part number", inp("part_number")) : null,
           kind === "product" ? field("Catalog #", inp("catalog_no")) : null,
-          field("Category", inp("category")), field("Subcategory", inp("subcategory")),
-          field("Default system", inp("system", { list: "syslist", placeholder: "Lighting: Can Light" })),
+          field("Category", catCombo.wrap), field("Subcategory", subCombo.wrap),
+          field("Default system", (() => { const c = combo(it.system || "", () => sysOpts, { placeholder: "Lighting: Can Light", what: "system" }); f.system = c.input; return c.wrap; })()),
           kind === "product" ? field("Preferred vendor", inp("vendor")) : null,
           kind !== "package" && kind !== "labor" ? field("Unit cost", inp("unit_cost", { type: "number", step: "any", min: "0" })) : null,
           kind !== "package" ? field("Unit sell" + (kind === "labor" ? " (optional)" : ""), inp("unit_price", { type: "number", step: "any", min: "0", placeholder: priceHint ? "at rate" : "" })) : null,
@@ -609,6 +655,7 @@ async function renderSettings(sub) {
   const codes = SET.costCodes.map(c => ({ ...c, rates: { ...c.rates }, aliases: [...(c.aliases || [])] }));
   const pays = SET.paySchedules.map(p => ({ ...p, steps: p.steps.map(s => ({ ...s })) }));
   const sys = SET.systems.map(s => ({ ...s, subs: [...s.subs] }));
+  const cats = (SET.categories || []).map(c => ({ ...c, subs: [...c.subs] }));
   const saveBtn = (label, fn) => can ? h("button.btn.pri.sm", { onclick: async () => { try { await fn(); SET = await api("/api/settings"); toast("Saved."); renderSettings(); } catch (e) { toast(e.message, true); } } }, label) : null;
 
   // cost codes
@@ -645,6 +692,16 @@ async function renderSettings(sub) {
     h("div.chips", s.subs.map((x, j) => h("span.chip", x, can ? h("button", { title: "Remove", onclick: () => { s.subs.splice(j, 1); drawSys(); } }, "×") : null)),
       can ? h("input", { placeholder: "+ Subsystem", style: { width: "150px", minHeight: "28px" }, onkeydown: e => { if (e.key === "Enter" && e.target.value.trim()) { s.subs.push(e.target.value.trim()); drawSys(); } } }) : null))));
   drawSys();
+
+  // catalog categories and subcategories
+  const catBox = h("div"), catQ = h("input", { type: "search", placeholder: "Find a category…", style: { width: "260px", marginBottom: "8px" }, oninput: () => drawCats() });
+  const drawCats = () => { const q = catQ.value.trim().toLowerCase();
+    fill(catBox, cats.map((c, i) => (!q || c.name.toLowerCase().includes(q) || c.subs.some(x => x.toLowerCase().includes(q))) ? h("div.sys",
+      h("div.row", h("input", { value: c.name, style: { fontWeight: 600, flex: "1" }, disabled: ro, onchange: e => c.name = e.target.value }),
+        can ? h("button.btn.sm.danger", { onclick: () => { cats.splice(i, 1); drawCats(); } }, "Remove") : null),
+      h("div.chips", c.subs.map((x, j) => h("span.chip", x, can ? h("button", { title: "Remove", onclick: () => { c.subs.splice(j, 1); drawCats(); } }, "×") : null)),
+        can ? h("input", { placeholder: "+ Subcategory", style: { width: "150px", minHeight: "28px" }, onkeydown: e => { if (e.key === "Enter" && e.target.value.trim()) { c.subs.push(e.target.value.trim()); drawCats(); } } }) : null)) : null)); };
+  drawCats();
 
   // lead numbers
   const leadIn = {};
@@ -690,6 +747,9 @@ async function renderSettings(sub) {
     h("div.card", h("header", h("h2", "Systems"), saveBtn("Save systems", () => api("/api/settings/systems", { method: "PUT", json: { systems: sys } }))),
       h("div.bd", h("p.muted.small", { style: { marginTop: 0 } }, "A system and its subsystems, like Lighting with Can Light and Tape Light. The D-Tools import adds any it finds. Type a subsystem and press Enter."), sysBox,
         can ? h("button.btn.sm", { onclick: () => { sys.push({ name: "New system", subs: [] }); drawSys(); } }, "+ System") : null)),
+    h("div.card", h("header", h("h2", "Catalog categories"), saveBtn("Save categories", () => api("/api/settings/categories", { method: "PUT", json: { categories: cats } }))),
+      h("div.bd", h("p.muted.small", { style: { marginTop: 0 } }, "The categories and subcategories the catalog editor picks from. This started from what your catalog already uses; imports add any new ones they bring in. Type a subcategory and press Enter."), catQ, catBox,
+        can ? h("button.btn.sm", { onclick: () => { cats.unshift({ name: "New category", subs: [] }); drawCats(); } }, "+ Category") : null)),
     toCard);
   if (sub === "takeoff") setTimeout(() => toCard.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
 }

@@ -108,3 +108,4 @@ td.favcell { width: 28px; padding-right: 0; }
 button.star { background: none; border: 0; padding: 0 2px; font-size: 17px; line-height: 1; cursor: pointer; color: color-mix(in srgb, currentColor 35%, transparent); }
 button.star:hover, button.star.on { color: var(--gold, #eba91f); }
 .tab.favtab { color: var(--gold, #c98a0b); }
+.grid .picker .list div{font-weight:400;color:var(--fg);font-size:14px}

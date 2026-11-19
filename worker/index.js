@@ -129,6 +129,25 @@ async function leadCounters(env) {
 // "Lighting: Can Light", "Lighting\Can Light", "Lighting" -> { sys, sub }
 const splitSystem = s => { const t = str(s, 120); const m = t.split(/\s*[:\\/>]\s*/).filter(Boolean); return { sys: m[0] || "", sub: m.slice(1).join(" ") }; };
 const sysLabel = ({ sys, sub }) => sys ? (sub ? `${sys}: ${sub}` : sys) : "";
+// catalog categories and their subcategories (Tony, 2026-11-19): picked from this list in the catalog editor.
+// Until someone saves the list in Settings it is built from what the catalog already uses.
+async function categories(env) {
+  const v = await setting(env, "bids:categories"); if (Array.isArray(v)) return v;
+  const { results } = await env.DB.prepare("SELECT DISTINCT category, subcategory FROM bid_catalog WHERE category <> '' ORDER BY category COLLATE NOCASE, subcategory COLLATE NOCASE").all();
+  const list = []; mergeCats(list, (results || []).map(r => [r.category, r.subcategory])); return list;
+}
+function mergeCats(list, pairs) {
+  const by = new Map(list.map(c => [c.name.toLowerCase(), c])); let added = 0;
+  for (const [cat, sub] of pairs) { const c0 = String(cat || "").trim(), s0 = String(sub || "").trim(); if (!c0) continue;
+    let c = by.get(c0.toLowerCase()); if (!c) { c = { name: c0, subs: [] }; list.push(c); by.set(c0.toLowerCase(), c); added++; }
+    if (s0 && !c.subs.some(x => x.toLowerCase() === s0.toLowerCase())) { c.subs.push(s0); added++; } }
+  return added;
+}
+// imports add any category they bring in, once the list has been saved
+async function addCats(env, pairs) {
+  const v = await setting(env, "bids:categories"); if (!Array.isArray(v)) return;
+  if (mergeCats(v, pairs)) await putSetting(env, "bids:categories", v);
+}
 function mergeSystems(list, labels) {
   const by = new Map(list.map(s => [s.name.toLowerCase(), s]));
   let added = 0;
@@ -143,7 +162,7 @@ async function settingsApi(req, env, url, me) {
   if (write && !me.settings) return bad("Only Admins (or roles that can manage roles) can change settings.", 403);
   if (p === "/api/settings") {
     if (req.method !== "GET") return bad("Method not allowed", 405);
-    return json({ costCodes: await costCodes(env), paySchedules: await paySchedules(env), systems: await systems(env), leads: await leadCounters(env), divs: DIVS });
+    return json({ costCodes: await costCodes(env), paySchedules: await paySchedules(env), systems: await systems(env), categories: await categories(env), leads: await leadCounters(env), divs: DIVS });
   }
   const b = write ? await req.json().catch(() => null) : null;
   if (write && !b) return bad("Bad request");
@@ -168,6 +187,10 @@ async function settingsApi(req, env, url, me) {
       out.push({ id: str(s.id, 40) || crypto.randomUUID().slice(0, 8), name, steps });
     }
     await putSetting(env, "bids:paySchedules", out); return json({ ok: true, paySchedules: out });
+  }
+  if (p === "/api/settings/categories" && req.method === "PUT") {
+    const out = []; mergeCats(out, (Array.isArray(b.categories) ? b.categories : []).slice(0, 300).flatMap(c => { const n = str(c.name, 80); const subs = (Array.isArray(c.subs) ? c.subs : []).slice(0, 200).map(x => str(x, 80)).filter(Boolean); return subs.length ? subs.map(x => [n, x]) : [[n, ""]]; }));
+    await putSetting(env, "bids:categories", out); return json({ ok: true, categories: out });
   }
   if (p === "/api/settings/systems" && req.method === "PUT") {
     const out = (Array.isArray(b.systems) ? b.systems : []).slice(0, 200).map(s => ({ name: str(s.name, 60), subs: [...new Set((Array.isArray(s.subs) ? s.subs : []).map(x => str(x, 60)).filter(Boolean))].slice(0, 100) })).filter(s => s.name);
@@ -352,6 +375,7 @@ async function importRows(env, me, rows, dry) {
   }
   for (let i = 0; i < stmts.length; i += 200) await env.DB.batch(stmts.slice(i, i + 200));
   const sy = await systems(env), n = mergeSystems(sy, sysLabels); if (n) await putSetting(env, "bids:systems", sy); out.newSystems = n;
+  await addCats(env, batch.map(x => [x.o.category, x.o.subcategory]));
   return out;
 }
 
@@ -462,6 +486,7 @@ async function importPackages(env, me, rows, dry) {
   out.packages = pk.size; out.added = [...pk.keys()].filter(n => !pkgId.has(n)).length; out.updated = pk.size - out.added;
   out.missing = out.missing.slice(0, 200);
   if (dry) return out;
+  await addCats(env, [...pk.values()].map(P => [P.category, P.subcategory]));
   // first make every package (empty), so packages can hold each other in any order, then fill them
   for (const P of pk.values()) {
     const body = { kind: "package", manufacturer: "", model: P.name, category: P.category, subcategory: P.subcategory, short_desc: P.desc };
